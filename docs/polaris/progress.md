@@ -15,7 +15,7 @@
 | 3 | Polaris OAuth2 / Catalog 연동 | PASS | G-09/G-10/G-11/G-06 해결, 403/401 매핑, allowedNamespaces folder bug 수정, E2E harness `scripts/polaris-e2e`, [phase3-oauth-catalog.md](phase3-oauth-catalog.md), [security.md](security.md) | `3b85d3619` |
 | 4 | Object Storage | PASS | 공식 static baseline MinIO PASS (AWS는 ENVIRONMENT_BLOCKED), MinIO matrix, provider 생략/endpoint scheme 수정, vended credential runtime (G-04), HttpClient 4·Netty logger 고정, review 13건 반영, [storage.md](storage.md), [security.md](security.md) §7 | `691f2b5a9` |
 | 5 | 실제 E2E / Regression | PASS | Dremio → Polaris → MinIO E2E 7개 instance (lifecycle, read, write, namespace/view, cache/metadata, 장애, regression, UI): PASS 139 / FAIL 8 (kernel K-01 3, known C-08 3, known K-15 1, minor 1) / NOT_SUPPORTED 5. partitioned CTAS 수정, layout help text 수정, harness `sql.sh` 수정, [test-results.md §5](test-results.md#5-phase-5--실제-e2e--regression), [known-limitations.md](known-limitations.md) | `6d2f6f4e9` |
-| 6 | 최종 통합 / 문서 / Release Readiness | PASS (commit 대기) | C-08/C-17/K-01 수정, audit 반영(401 매핑 확장, 400/422 분류, log redaction, sensitive key 동기화 test, 중복 정리), release tarball(`dac/ui` 포함), 최종 smoke INSTANCE=3 PASS, 최종 review 반영(DDL 경로 `RESTException` 매핑, drop table 400/422 UNSUPPORTED_OPERATION, status 값 정리, live INSTANCE=4 재확인), Local CI full SUCCESS, 문서 7종 + [README.md](README.md) 완성 ([test-results.md §7](test-results.md#7-phase-6--최종-통합--release-readiness)) | Lead 기록 |
+| 6 | 최종 통합 / 문서 / Release Readiness | PASS | C-08/C-17/K-01 수정, audit 반영(401 매핑 확장, 400/422 분류, log redaction, sensitive key 동기화 test, 중복 정리), release tarball(`dac/ui` 포함), 최종 smoke INSTANCE=3 PASS, 최종 review 반영(DDL 경로 `RESTException` 매핑, drop table 400/422 UNSUPPORTED_OPERATION, status 값 정리, live INSTANCE=4 재확인), Local CI full SUCCESS, 문서 7종 + [README.md](README.md) 완성 ([test-results.md §7](test-results.md#7-phase-6--최종-통합--release-readiness)) | `b2bf2e0cc` |
 
 ## Phase 1 — 공통 완료 Gate
 
@@ -484,6 +484,21 @@ Local CI는 `sabot/kernel`을 build하지 않는다. K-01은 kernel module test(
 - Commit 범위: `docs/polaris/`, `plugins/icebergcatalog/`, `sabot/kernel/.../ManagedStoragePlugin.java`와 test. `.gitignore`, `.claude/`, `CLAUDE.md`, `dac/ui/CLAUDE.md`, `scripts/dev`는 feature와 무관한 tooling 변경이다 (따로 commit하거나 제외. `.claude/`를 commit하면 `settings.local.json`이 ignore되는지 확인).
 - Release 배포본: `distribution/server/target/dremio-community-26.0.5-202509091642240013-f5051a07.tar.gz` (md5 `410d54ef74edf36e4a4a48370da04138`, Phase 6 최종 code + Release build UI jar).
 
+### Phase 6 — AbleOps Local CI 원격 검증
+
+`localci submit --profile full --no-cache` (run `4f295c83`, commit `b2bf2e0cc`, 원격 Agent의 새 작업 공간, 146 s):
+
+| 구분 | Step | 결과 |
+|---|---|---|
+| 컴파일 + 테스트 | `icebergcatalog-test` | SUCCESS (412 tests, 0 failures, 0 skipped) |
+| 컴파일 + 테스트 | `s3-test` | SUCCESS (112 tests, 0 failures, 0 skipped) |
+| lint | `icebergcatalog-lint` | SUCCESS |
+| 후속: 정적 분석 | `icebergcatalog-static` | SUCCESS |
+| 후속: UI | `ui-source-specs` | SUCCESS (103 passing) |
+| 후속: harness | `e2e-harness-lint` | SUCCESS |
+
+- 원격 압축본은 32 MiB 제한 때문에 `sabot/kernel/src`를 제외하므로, K-01 kernel 변경(`ManagedStoragePlugin`)은 로컬에서 검증했다: `TestManagedStoragePlugin` + `TestPluginsManager` 34 tests 0 failures, `sabot/kernel` lint SUCCESS, errorprone 포함 compile SUCCESS (`ManagedStoragePlugin.java` 재컴파일 확인).
+
 ## 완료 기준 현황
 
 `[ ]`는 아직 충족하지 않았다는 뜻이다. 현재 상태와 근거를 함께 적는다.
@@ -506,7 +521,7 @@ Local CI는 `sabot/kernel`을 build하지 않는다. K-01은 kernel module test(
 | 14 | `[x]` Generic RESTCATALOG 회귀 없음 | PASS | Phase 5: `apache/iceberg-rest-fixture`(OAuth/warehouse/scope 없음) E2E에서 CREATE FOLDER/TABLE, INSERT, SELECT, CTAS, UPDATE, DROP PASS. UI generic tile 생성(U-9–U-12). icebergcatalog 386, plugins/s3 112, dac/backend 78, UI spec 103 passing. Phase 6: icebergcatalog 412, kernel 34, s3 112, UI spec 103 (Local CI) |
 | 15 | `[x]` 관련 unit/integration/E2E 검증 | PASS | Phase 3 251 tests, Phase 4 62 + 2, Phase 5 신규 5 + flaky 수정 1, Phase 6 신규 26 + kernel 2. E2E harness로 7개 instance live (test-results.md §5), Phase 6 release tarball smoke 2회 (test-results.md §7.3). 별도 opt-in IT는 만들지 않았다 (harness E2E로 대신) |
 | 16 | `[x]` 문서 완료 | PASS | 작업 정의의 7종(design, configuration(§1 UI, §2 REST API, §3 Polaris+S3, §4 MinIO), storage, security, test-results, known-limitations, progress) + compatibility-matrix, phase1/phase3 문서, [README.md](README.md). Secret은 placeholder만. 남은 `TBD` 없음. 결과 상태는 spec의 네 값만 쓴다: 최종 review에서 비표준 값(`미검증 (범위 밖)`, `기록`, `PASS (수정됨)`)을 찾아 실행하지 않은 항목은 `NOT_SUPPORTED (검증하지 않음: <이유>)`, 환경이 없던 항목은 `ENVIRONMENT_BLOCKED`로 바꿨다. 괄호는 비고다 |
-| 17 | `[ ]` 모든 Phase commit/push 완료 | IN_PROGRESS | Phase 1 `67cf10e4c`, Phase 2 `f2553db4a` (+ `ffd1cc1b2`), Phase 3 `3b85d3619`, Phase 4 `691f2b5a9`, Phase 5 `6d2f6f4e9` (push 완료). Phase 6 commit/push 대기 (Lead) |
+| 17 | `[x]` 모든 Phase commit/push 완료 | PASS | Phase 1 `67cf10e4c`, Phase 2 `f2553db4a` (+ `ffd1cc1b2`), Phase 3 `3b85d3619`, Phase 4 `691f2b5a9`, Phase 5 `6d2f6f4e9`, Phase 6 `b2bf2e0cc`. 모두 `origin/feature/polaris-restcatalog`에 push 완료 |
 
 ## Gap 요약 (상세: [phase1-analysis.md §4](phase1-analysis.md#4-gap-목록))
 
