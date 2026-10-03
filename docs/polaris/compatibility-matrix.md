@@ -1,7 +1,7 @@
 # Polaris / RESTCATALOG Compatibility Matrix
 
-- 기준: Dremio OSS 26.0.5 + Phase 2/3 변경 (`feature/polaris-restcatalog`), Apache Polaris `1.1.0-incubating`, Iceberg `1.7.0-5f7c992-20250730084652-3bf8b99` (`pom.xml:82`)
-- 갱신 시점: Phase 3 Integration (2026-10-03). Phase 1 근거는 [phase1-analysis.md](phase1-analysis.md), Phase 2 live gate는 [progress.md](progress.md#phase-2--restcatalog-oss-source-완성), Phase 3 결과는 [phase3-oauth-catalog.md](phase3-oauth-catalog.md)에 있다.
+- 기준: Dremio OSS 26.0.5 + Phase 2/3/4 변경 (`feature/polaris-restcatalog`), Apache Polaris `1.1.0-incubating`, Iceberg `1.7.0-5f7c992-20250730084652-3bf8b99` (`pom.xml:82`)
+- 갱신 시점: Phase 4 Integration + review 반영 (2026-10-03). Storage 상세는 [storage.md](storage.md). Phase 1 근거는 [phase1-analysis.md](phase1-analysis.md), Phase 2 live gate는 [progress.md](progress.md#phase-2--restcatalog-oss-source-완성), Phase 3 결과는 [phase3-oauth-catalog.md](phase3-oauth-catalog.md)에 있다.
 
 ## 상태 값
 
@@ -27,6 +27,7 @@ Status 열에는 아래 값만 쓴다.
 | **E2E** | 실제 Dremio SQL 경로로 확인 |
 | **live-P2** | Phase 2 in-tree build tarball + Polaris 1.1.0 + 로컬 MinIO로 REST API/SQL 확인 (smoke) |
 | **live-P3** | Phase 3 tarball + Polaris 1.1.0 + 로컬 MinIO, `scripts/polaris-e2e` harness (Agent A–D 각 instance와 integration 재검증 INSTANCE=5) |
+| **live-P4** | Phase 4 tarball + Polaris 1.1.0 + 로컬 MinIO(+ TLS/region용 throwaway MinIO), harness (Agent A–D, integration 재검증 INSTANCE=5, review 반영 재검증 INSTANCE=6). 상세: [storage.md §14](storage.md#14-검증-matrix) |
 | **unit** | icebergcatalog module unit test |
 
 ---
@@ -47,7 +48,7 @@ Status 열에는 아래 값만 쓴다.
 | `restEndpointUri` | String (required) | — | null | Endpoint URI | 10 | PASS (`@NotBlank`, G-17) | PASS (live-P2). 누락 시 400 validation error | layout에서도 required |
 | `allowedNamespaces` | Array<String> | (optional) | null (= 전체, recursive) | Allowed Namespaces | 11 | PASS | PASS (live-P3: nested entry의 부모 folder 유지 수정 후) | separator는 option `plugins.restcatalog.allowed.ns.separator`(`\\.`, regex)로 정한다. discovery 범위만 정하며 접근 제어는 아니다 |
 | `isRecursiveAllowedNamespaces` | Boolean | true | true | Allowed Namespaces include their whole subtrees | 12 | PASS | PASS (live-P3) | false면 직접 하위 namespace가 빈 folder로 보인다 (C B-5, 문서화) |
-| `isUsingVendedCredentials` | Boolean (required) | UI: checked (true) / Polaris OSS recipe: false | false | Use vended credentials / Use vended credentials | 13 | PASS (unit: tag, 기본값, 25.2.0 bytes 호환) | PASS (live-P2: false/true 모두 200) | `@NotMetadataImpacting`. 기본값 false는 기존 source 동작 유지를 위한 것. true면 header만 보낸다 (G-04) |
+| `isUsingVendedCredentials` | Boolean (required) | UI: checked (true) / Polaris OSS recipe: false | false | Use vended credentials / Use vended credentials | 13 | PASS (unit: tag, 기본값, 25.2.0 bytes 호환) | PASS (live-P2: false/true 모두 200) | `@NotMetadataImpacting`. 기본값 false는 기존 source 동작 유지를 위한 것. true면 header를 보내고 Phase 4부터 vended S3 credential을 table별로 쓴다 (G-04 해결, live-P4) |
 | Source type `RESTCATALOG` | — | "Dremio source type: RESTCATALOG" | `@SourceType("RESTCATALOG")` | Iceberg REST Catalog / Iceberg REST Catalog (UI 상수도 동일) | — | PASS (unit) | PASS (live-P2: `/api/v3/source/type` 200, create 200) | Polaris 전용 type 없음. Polaris는 UI preset |
 | uiConfig layout | — | General / Advanced Options / Reflection Refresh / Metadata / Privileges | `restcatalog-layout.json` (General / Advanced Options) | — | — | PASS (unit: propName ↔ `@Tag` 필드 일치) | PASS (live-P2: `/api/v3/source/type/RESTCATALOG`에 uiConfig) | 나머지 tab은 UI가 공통으로 추가한다. 브라우저 생성은 미실행 |
 
@@ -56,15 +57,15 @@ Status 열에는 아래 값만 쓴다.
 | UI 위치 | Key | 예시 값 | OSS 처리 | 검증 | Status |
 |---|---|---|---|---|---|
 | General | Endpoint URI | `http://<polaris>:8181/api/catalog` | Iceberg `uri` | client-probe, proto-E2E | PASS |
-| General | Use vended credentials | Unchecked | `isUsingVendedCredentials` (tag 13). true면 `header.X-Iceberg-Access-Delegation=vended-credentials` | unit, live-P2 | PASS (flag). credential 사용은 NOT_SUPPORTED (G-04) |
+| General | Use vended credentials | Unchecked | `isUsingVendedCredentials` (tag 13). true면 `header.X-Iceberg-Access-Delegation=vended-credentials`를 보내고 Phase 4부터 table별 vended S3 credential로 파일에 접근한다 | unit, live-P2, live-P4 | PASS (flag, runtime: Polaris OSS + MinIO, single node) |
 | Catalog Properties | `warehouse` | `<polaris_catalog>` (대소문자 정확히 일치) | `/v1/config?warehouse=`로 전달. 응답의 `prefix` 사용 | client-probe, proto-E2E | PASS |
 | Catalog Properties | `scope` | `PRINCIPAL_ROLE:ALL` | Iceberg OAuth2. 기본값 `catalog`는 Polaris가 거부 | client-probe, proto-E2E, live-P3 | PASS (scope 지정 시). 미지정/잘못된 scope는 source 생성 400과 `invalid_scope` hint (Phase 3) |
-| Catalog Properties | `fs.s3a.aws.credentials.provider` | `org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider` | Hadoop conf. 비어 있고 access key가 있으면 `FileSystemConfUtil`이 자동으로 채운다 | live-P2 (MinIO) | PASS (MinIO smoke). AWS S3는 TBD (Phase 4) |
+| Catalog Properties | `fs.s3a.aws.credentials.provider` | `org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider` | Hadoop conf. Phase 4 이전에는 생략하면 Hadoop 기본 chain이 남아 `Invalid AWSCredentialsProvider provided`로 실패했다 ("비어 있으면 자동으로 채운다"는 Phase 1–3 설명은 틀렸다). Phase 4부터 plugin이 Hadoop 기본 chain만 `SimpleAWSCredentialsProvider`로 바꾼다: key가 있으면 그대로 동작하고, 없으면 host의 `AWS_*` env나 instance profile로 넘어가지 않고 실패한다. 빈 값을 명시하면 `FileSystemConfUtil`이 access key / `AWS_*` env / instance profile 순으로 정한다 (opt-in) | unit, live-P4 (MinIO: 명시 `base`, 생략 `noprov`, key 없음 `snp`, 빈 값 `sne`) | PASS (MinIO). AWS S3는 ENVIRONMENT_BLOCKED |
 | Catalog Properties | `oauth2-server-uri` (권장, 공식 Polaris recipe에는 없음) | `http://<polaris>:8181/api/catalog/v1/oauth/tokens` | 미지정 시 `<uri>/v1/oauth/tokens`와 deprecation WARN | client-probe | PASS |
 | Catalog Properties | `token-refresh-enabled` | 기본 true (false 금지) | Iceberg | client-probe (PT20S), live-P3 (Polaris token TTL 60초) | PASS. false면 만료 직후 query 1건이 실패하고 state check가 client를 교체한다 |
 | Catalog Properties | `rest.client.connection-timeout-ms` / `rest.client.socket-timeout-ms` / `rest.client.max-retries` | 권장 `10000` / `60000` / 기본 5 | Iceberg HTTPClient. Hadoop conf로 복사하지 않는다 (Phase 3) | unit, live-P3 | PASS. 미설정이면 timeout 3분 ([security.md §5](security.md#5-재시도와-timeout-iceberg-rest-client)) |
 | Catalog Credentials | `credential` | `<client_id>:<client_secret>` | OAuth2 client_credentials | client-probe, proto-E2E | PASS |
-| Catalog Credentials | `fs.s3a.access.key` / `fs.s3a.secret.key` | `<s3AccessKey>` / `<s3SecretKey>` | Hadoop conf로 S3FileSystem에 전달 (Phase 2부터 `start()` 시점 eager copy, G-07) | unit, live-P2 (MinIO) | PASS (MinIO smoke). AWS S3는 TBD (Phase 4) |
+| Catalog Credentials | `fs.s3a.access.key` / `fs.s3a.secret.key` | `<s3AccessKey>` / `<s3SecretKey>` | Hadoop conf로 S3FileSystem에 전달 (Phase 2부터 `start()` 시점 eager copy, G-07) | unit, live-P4 (MinIO 공식 baseline 전체 cycle) | PASS (MinIO). AWS S3는 ENVIRONMENT_BLOCKED |
 
 ---
 
@@ -100,7 +101,7 @@ Dremio plugin 사용 여부와 Polaris 1.1.0 지원 여부를 함께 표시한�
 | `DELETE …/views/{v}` (Polaris 기본 설정) | Yes | 403 `Unable to purge entity` | client-probe, live-P3 | PASS (오류 매핑) | Phase 3: permission error + `polaris.config.drop-with-purge.enabled` hint (G-06 해결). drop 자체는 catalog 설정이 필요하다 |
 | `DELETE …/views/{v}` (`polaris.config.drop-with-purge.enabled=true`) | Yes | 204 | client-probe | PASS | |
 | `POST /v1/{prefix}/views/rename` | No | Yes | client-probe | NOT_SUPPORTED | |
-| `X-Iceberg-Access-Delegation: vended-credentials` | 부분: `isUsingVendedCredentials=true`이면 header 전송 (Phase 2). 응답 credential은 미사용 | Yes. Phase 2 live에서는 `CATALOG_MANAGE_CONTENT` grant만으로 loadTable 200과 `s3.*` 반환 (Phase 1 관찰: grant 없으면 root도 403) | unit, live-P2 | NOT_SUPPORTED (runtime) | G-04. 읽기/쓰기는 source의 static `fs.s3a.*`로 한다. Phase 4에서 재평가 |
+| `X-Iceberg-Access-Delegation: vended-credentials` | Yes (Phase 4): `isUsingVendedCredentials=true`이면 header 전송, loadTable/staged create 응답 `config`의 `s3.*` credential을 table별 S3 FileSystem에 적용, 만료 전 갱신 | Yes. `CATALOG_MANAGE_CONTENT`만으로 loadTable 200과 `s3.*`(MinIO STS `AssumeRole`, table prefix scope) 반환 | unit, live-P4 | PASS (Polaris OSS + MinIO, single node) | G-04 해결. S3 credential만 옮기고 endpoint/region은 source 설정 (bucket discovery는 끈다). static key도 있는 source는 아직 없는 table을 static key로 쓴다. vended만 있는 source의 기본 location 밖 `LOCATION`은 NOT_SUPPORTED ([storage.md §12](storage.md#12-vended-credentials-compatibility-결과)) |
 
 ---
 
@@ -118,7 +119,7 @@ Dremio plugin 사용 여부와 Polaris 1.1.0 지원 여부를 함께 표시한�
 | `SELECT … AT SNAPSHOT/TIMESTAMP` | `TimeTravelProcessors` | 동일 | 지원 | TBD (Phase 5) |
 | `CREATE TABLE` | `createEmptyTable` → `buildTable().create()` | `plugins.restcatalog.mutable.enabled` | 지원 | PASS (smoke) |
 | `CREATE TABLE … AS SELECT` (CTAS) | `createNewTable` → staged create. namespace `location` 필요 (Polaris는 자동 설정) | `mutable.enabled` | 지원. PARTITION BY는 upstream 26.0.8 fix가 없음 (G-26) | PASS (live-P3, unpartitioned). partitioned는 TBD (Phase 5) |
-| CTAS with out-of-tree `LOCATION` | 위와 동일 | `mutable.enabled` | Polaris 403 → permission error (Phase 3 매핑, unit) | TBD (Phase 5 live) |
+| CTAS with out-of-tree `LOCATION` | 위와 동일 | `mutable.enabled` | Polaris 403 → permission error (Phase 3 매핑, unit). Polaris는 namespace location 밖의 `LOCATION`을 commit에서 거부한다 ("Invalid locations … not in the list of allowed locations", unstructured table location 기본 off) | namespace 안, 기본 table location 밖: PASS (live-P4 review INSTANCE=6, static key source와 vended+static key source). vended credential만 있는 source는 NOT_SUPPORTED ([storage.md §12.4](storage.md#124-known-limitations)) |
 | `INSERT INTO` | `IcebergCatalogModel` commit | `mutable.enabled` | 지원 | PASS (smoke, MinIO) |
 | `UPDATE` / `DELETE` / `MERGE` | `FileSystemTableModifyPrule:44` (`SupportsIcebergRestApi`) | `mutable.enabled` | 지원. positional delete 관련 upstream 26.1.6 fix가 없음 | PASS (live-P3 smoke, B: 4 snapshots). 정식 검증은 Phase 5 |
 | `OPTIMIZE TABLE` / `VACUUM TABLE` | `FileSystemTableOptimizePrule:44`, `FileSystemVacuumTablePrule:43` | `mutable.enabled` | 지원 | TBD (Phase 5) |
@@ -141,19 +142,28 @@ Dremio plugin 사용 여부와 Polaris 1.1.0 지원 여부를 함께 표시한�
 
 ### Storage
 
+상세 설정과 matrix: [storage.md](storage.md).
+
 | 모드 | 설정 | 검증 | Status | 비고 |
 |---|---|---|---|---|
-| AWS S3 static key (공식 Polaris OSS recipe) | `fs.s3a.aws.credentials.provider=SimpleAWSCredentialsProvider`, secret `fs.s3a.access.key`/`fs.s3a.secret.key` | static | TBD (Phase 4) | 필수 성공 기준. 실제 AWS 계정이 없으면 ENVIRONMENT_BLOCKED가 될 수 있다 |
-| MinIO / S3-compatible (path-style, custom endpoint) | `fs.s3a.endpoint=<host>:<port>` (scheme 없음), `fs.s3a.connection.ssl.enabled=false`, `fs.s3a.path.style.access=true`, `dremio.s3.compat=true`, `dremio.bucket.discovery.enabled=false`, `dremio.s3.region=us-east-1`, `fs.s3a.requester.pays.enabled=false` | live-P2 (로컬 MinIO, 이 key 묶음 그대로) | PASS (smoke) | CREATE/INSERT/SELECT/재시작 확인. key별 필요 여부는 Phase 4에서 실측 |
-| `fs.s3a.endpoint`에 scheme 포함 (`http://minio:9000`) | — | static (`S3FileSystem.java:788-791`) | FAIL | `http://http://…`가 된다. 문서에 명시 |
-| Requester-pays 기본값 (true) | `S3ClientProperties.java:129` | static | TBD (Phase 4) | MinIO에서는 false를 권장 (26.1.8 동작과 맞춤) |
-| S3 env credential / InstanceProfile fallback | provider 미지정, access key 없음 | static (`FileSystemConfUtil.java:228-247`) | TBD (Phase 4) | |
-| S3 assumed role | `fs.s3a.assumed.role.arn` + `com.dremio.plugins.s3.store.STSCredentialProviderV1` | static | TBD (Phase 4) | |
-| Azure shared key | `fs.azure.account.key…` | static | TBD (Phase 4) | 범위 밖. 확인만 한다 |
-| Polaris FILE storage (local test 전용) | Polaris flag 2개와 readiness ignore. host와 경로 공유 | client-probe | TBD (Phase 4) | Dremio에서 `file://` 경로로 읽는 것은 미검증 |
-| Polaris 서버 측 S3 (MinIO) metadata write | storageConfigInfo `endpoint` + `pathStyleAccess`, AWS_* env | client-probe | PASS | Polaris가 metadata.json을 직접 쓴다 |
-| Vended credentials (`isUsingVendedCredentials=true`) | header + Polaris grant | client-probe, unit, live-P2 (flag true source: state good, SELECT는 static key로 성공) | NOT_SUPPORTED | header는 보내지만 Dremio가 응답 credential을 버린다 (G-04). Phase 4에서 별도 compatibility 결과로 기록 |
-| Executor storage 설정 (multi-node) | `start()`/`getFsConfCopy()`에서 eager copy | unit | PASS (unit) | G-07 해결. multi-node 실측은 Phase 5 |
+| AWS S3 static key (공식 Polaris OSS recipe) | `fs.s3a.aws.credentials.provider=SimpleAWSCredentialsProvider`, secret `fs.s3a.access.key`/`fs.s3a.secret.key` | static, unit | ENVIRONMENT_BLOCKED | 실제 AWS 계정 없음. 같은 key 묶음 + MinIO endpoint로는 PASS (아래) |
+| 공식 baseline + MinIO endpoint (필수 성공 기준) | 위 + `fs.s3a.endpoint=<host>:<port>`, `fs.s3a.connection.ssl.enabled=false`, `fs.s3a.path.style.access=true`, `dremio.s3.compat=true` | live-P4 (A INSTANCE=1, Integration `base`) | PASS | CREATE/INSERT/CTAS/INSERT…SELECT/UPDATE/DELETE, metadata table, `AT SNAPSHOT`, 재시작. Polaris snapshot id 일치 |
+| MinIO recipe의 key별 필요 여부 | endpoint·compat·(HTTP면) ssl false 필수. path-style은 hostname endpoint면 필수. discovery/`dremio.s3.region`/requester-pays는 불필요 | live-P4 (A, B) | PASS | Phase 2 recipe(모든 key 포함)도 PASS. [storage.md §4](storage.md#4-property-reference) |
+| `fs.s3a.aws.credentials.provider` 생략 | — | unit, live-P4 (`noprov`, review INSTANCE=6 재확인) | PASS (Phase 4 수정) | 이전에는 `Invalid AWSCredentialsProvider provided` (FAIL). plugin이 Hadoop 기본 chain(만)을 `SimpleAWSCredentialsProvider`로 바꾼다. key가 없으면 fail closed (아래 env fallback 행) |
+| `fs.s3a.endpoint`에 scheme 포함 (`http://minio:9000`) | — | unit (`TestS3FileSystem`), live-P4 (`scheme`, `scheme2`, B의 `https://` TLS) | PASS (Phase 4 수정) | 이전에는 `http://http://…`로 hang (FAIL, G-08). `S3FileSystem.getEndpoint()`가 scheme을 유지한다. 권장 형식은 여전히 `host:port` |
+| TLS (self-signed CA) | truststore (`DREMIO_JAVA_SERVER_EXTRA_OPTS`, Polaris `JAVA_OPTS_APPEND`) | live-P4 (B) | PASS | truststore 없으면 PKIX (Dremio), 422 (Polaris) |
+| Non-default region MinIO | `fs.s3a.endpoint.region=<region>` | live-P4 (B) | PASS | `dremio.s3.region`만으로는 S3A가 us-east-1로 서명해 FAIL |
+| AWS region id가 아닌 region 이름 (`minio-local`) | — | live-P4 (B) | NOT_SUPPORTED | `S3PluginUtils` region 검사 |
+| Requester-pays 기본값 (true) | `S3ClientProperties.java:129` | live-P4 (B MinIO trace) | PASS (MinIO) / ENVIRONMENT_BLOCKED (AWS requester-pays bucket) | MinIO는 header 무시. AWS 일반 bucket은 `false` 권장 |
+| Bucket discovery 기본값 (true) | `dremio.bucket.discovery.enabled` | live-P4 (A E11, B) | PASS (MinIO) / ENVIRONMENT_BLOCKED (AWS, `ListAllMyBuckets` 없는 user) | MinIO는 거부 대신 filtering. vended credential을 쓰는 table FS는 discovery를 항상 끈다 (table prefix로 scope된 credential에는 `ListAllMyBuckets`가 없다. unit) |
+| Key도 provider도 없는 source (fail closed) | access key 없음, provider 생략 | unit, live-P4 review (INSTANCE=6 `snp`) | PASS (fail closed) | Dremio host의 `AWS_*` env나 EC2 instance profile로 넘어가지 않는다: 읽기 PERMISSION ERROR, 쓰기 `SimpleAWSCredentialsProvider: No AWS credentials in the Hadoop configuration`. Hadoop 기본 chain을 그대로 두면 S3A가 env provider까지 시도했다 (review 1차 live: "Unable to load AWS credentials from environment variables") |
+| S3 env credential / InstanceProfile fallback (opt-in) | provider를 **빈 값으로 명시**, access key 없음 | live-P4 (A C5, review `sne`) | instance profile: ENVIRONMENT_BLOCKED (EC2 아님, IMDS 연결 실패). `AWS_*` env: 미검증 (AWS 계정과 무관하게 test 가능하지만 실행하지 않음) | vended source에서 credential을 받지 못한 table도 이 경로를 탄다. [security.md §7.4](security.md#74-phase-4-storage-secret-처리-원칙) |
+| S3 assumed role | `fs.s3a.assumed.role.arn` + `com.dremio.plugins.s3.store.STSCredentialProviderV1` | static | ENVIRONMENT_BLOCKED | AWS 계정 없음 |
+| Azure shared key | `fs.azure.account.key…` | static | TBD (Phase 5) | 범위 밖. vended ADLS credential은 매핑하지 않는다 |
+| Polaris FILE storage (local test 전용) | Polaris flag 2개와 readiness ignore | client-probe | TBD (Phase 5) | Dremio에서 `file://` 경로로 읽는 것은 미검증 |
+| Polaris 서버 측 S3 (MinIO) metadata write | storageConfigInfo `endpoint`(scheme 필수) + `pathStyleAccess` + `region`, AWS_* env | client-probe, live-P4 (B trace) | PASS | `metadata.json`은 Polaris, data/manifest는 Dremio가 쓴다. Polaris는 vended 요청이 없어도 STS subscoped key를 쓴다 |
+| Vended credentials (`isUsingVendedCredentials=true`) | header + Polaris grant (`CATALOG_MANAGE_CONTENT`) | unit (33), live-P4 (C, Integration `vn`, review INSTANCE=6 `vn`/`vk`/`vbp`) | PASS (compatibility 결과, single node) | static S3 key 없이 SELECT/INSERT/CTAS/UPDATE/DELETE/OPTIMIZE, 만료 후 갱신. static key도 있는 source는 새 table을 static key로 쓴다 (기본 location 밖 `LOCATION` PASS). vended만 있는 source의 기본 location 밖 `LOCATION`은 NOT_SUPPORTED, read-only INSERT는 SYSTEM `AmazonS3Exception`. AWS vending과 multi-node는 ENVIRONMENT_BLOCKED |
+| Executor storage 설정 (multi-node) | `start()`/`getFsConfCopy()`에서 eager copy. vended면 node별로 catalog에 직접 조회 | unit | PASS (unit) | G-07 해결. multi-node 실측은 Phase 5 |
 
 ### Auth
 
@@ -169,6 +179,6 @@ Dremio plugin 사용 여부와 Polaris 1.1.0 지원 여부를 함께 표시한�
 | External IdP (`oauth2-server-uri`) | `oauth2-server-uri=<idp>` | static, live-P3 (Polaris 자체 token endpoint를 명시) | PASS (Polaris endpoint) / ENVIRONMENT_BLOCKED (외부 IdP 없음) | |
 | SigV4 (`rest.sigv4-enabled`) | Glue/S3 Tables용 | static | NOT_SUPPORTED | Polaris에는 해당 없음 |
 | Secret masking (API GET/PUT) | `secretPropertyList` | proto-E2E, unit, live-P2 (v3 GET, v2 GET, masked PUT 후 state good) | PASS | `$DREMIO_EXISTING_VALUE$` |
-| Secret at-rest 암호화 | `List<Property>` | static | NOT_SUPPORTED | G-12. kernel 전체 범위의 open item |
+| Secret at-rest 암호화 | `List<Property>` | static, live-P4 (D) | NOT_SUPPORTED (기본) / PASS (`dremio-admin encrypt` 값 사용 시) | G-12. 평문 대신 `secret:1.…`를 넣으면 KV에 암호문만 남는다 (key는 같은 data dir). kernel 전체 범위의 open item |
 | `propertyList`(plain)에 secret key | — | unit (backend WARN, key 이름만), UI spec (validator가 저장 차단) | PASS | G-13. UI와 backend가 같은 판정 규칙을 쓴다. Edit에서는 이미 저장된 key는 막지 않고 새/이름 바뀐 row만 막는다. API로 저장하면 backend WARN만 남는다 |
-| Secret 로그 노출 (기본 log level) | — | proto-E2E, unit, live-P2, live-P3 (DEBUG 포함, 5개 instance 모두 0건) | PASS | HttpClient wire/headers logger는 `conf/logback.xml`에서 INFO로 고정된다. 상세는 [security.md](security.md) |
+| Secret 로그 노출 (기본 log level) | — | proto-E2E, unit, live-P2, live-P3, live-P4 (DEBUG, vended 값 포함 0건) | PASS | HttpClient 5 wire/headers, HttpClient 4 wire/headers(S3A), SigV4 signer, Netty `LoggingHandler`/`Http2FrameLogger`(AWS SDK v2 async S3 읽기) logger는 `conf/logback.xml`에서 INFO로 고정된다 (HttpClient 4와 Netty는 Phase 4 추가. Netty `LoggingHandler`를 DEBUG로 두면 session token이 찍히는 것을 unit으로 확인). 상세는 [security.md](security.md) |

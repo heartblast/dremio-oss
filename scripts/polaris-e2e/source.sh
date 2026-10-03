@@ -102,6 +102,7 @@ build_body() { # build_body MASK(0|1)
          {name: "dremio.s3.compat", value: "true"},
          {name: "dremio.bucket.discovery.enabled", value: "false"},
          {name: "dremio.s3.region", value: $region},
+         {name: "fs.s3a.endpoint.region", value: $region},
          {name: "fs.s3a.requester.pays.enabled", value: "false"}]) as $base
     | (csv($extra) | map(capture("^(?<name>[^=]+)=(?<value>.*)$"))) as $extraProps
     | ($extraProps | map(.name)) as $extraNames

@@ -88,10 +88,12 @@ import org.apache.iceberg.exceptions.BadRequestException;
 import org.apache.iceberg.exceptions.ForbiddenException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
+import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.exceptions.NoSuchViewException;
 import org.apache.iceberg.exceptions.NotAuthorizedException;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.rest.DremioRESTTableOperations;
+import org.apache.iceberg.types.Types;
 import org.apache.iceberg.view.BaseView;
 import org.apache.iceberg.view.View;
 import org.apache.iceberg.view.ViewBuilder;
@@ -124,6 +126,13 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
   private final UnaryOperator<String> redactor;
 
   public static final String DEFAULT_BASE_LOCATION = "default-base-location";
+
+  /**
+   * Schema of the staged creation used by {@link #loadTableStorageProperties} for a table that does
+   * not exist yet. Any valid schema does: the staged table is never committed.
+   */
+  private static final Schema STAGED_CREATE_SCHEMA =
+      new Schema(Types.NestedField.optional(1, "placeholder", Types.StringType.get()));
 
   public AbstractRestCatalogAccessor(
       Supplier<Catalog> catalogSupplier,
@@ -588,6 +597,55 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
     TableIdentifier tableIdentifier = tableIdentifierFromDataset(dataset);
     BaseView baseView = (BaseView) loadView(tableIdentifier);
     return baseView.operations().current();
+  }
+
+  /**
+   * Loads the table directly from the catalog (not through the per-user table cache: this runs
+   * wherever a file system for the table is created, also without a user context) and returns the
+   * properties of the FileIO that the Iceberg REST client built for it from the catalog's response.
+   */
+  @Override
+  public Map<String, String> loadTableStorageProperties(
+      TableIdentifier tableIdentifier, boolean stageNewTable) {
+    Catalog catalog = getCatalog();
+    try {
+      try {
+        return ioProperties(catalog.loadTable(tableIdentifier).io());
+      } catch (NoSuchTableException e) {
+        if (!stageNewTable) {
+          return Collections.emptyMap();
+        }
+        // CTAS writes the data files of a new table before it creates the table in the catalog
+        // (staged create, then commit). A staged creation at the table's default location, which
+        // CTAS uses unless it is given a LOCATION, returns the credentials for that location. It
+        // is discarded: nothing is committed, so the catalog does not create the table.
+        try {
+          return ioProperties(
+              catalog
+                  .newCreateTableTransaction(tableIdentifier, STAGED_CREATE_SCHEMA)
+                  .table()
+                  .io());
+        } catch (NoSuchNamespaceException missingNamespace) {
+          return Collections.emptyMap();
+        } catch (AlreadyExistsException createdMeanwhile) {
+          return ioProperties(catalog.loadTable(tableIdentifier).io());
+        }
+      }
+    } catch (ForbiddenException e) {
+      throw forbidden(e, "load the storage credentials of table", bracket(tableIdentifier));
+    } catch (NotAuthorizedException e) {
+      throw notAuthorized(e, "load the storage credentials of table", bracket(tableIdentifier));
+    }
+  }
+
+  private static Map<String, String> ioProperties(FileIO io) {
+    try {
+      Map<String, String> properties = io.properties();
+      return properties == null ? Collections.emptyMap() : properties;
+    } catch (UnsupportedOperationException e) {
+      // A custom io-impl that does not expose its configuration.
+      return Collections.emptyMap();
+    }
   }
 
   @Override

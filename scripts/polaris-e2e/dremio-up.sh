@@ -87,7 +87,12 @@ ENVF
 
 log "starting Dremio web=$DREMIO_WEB_PORT client=$DREMIO_CLIENT_PORT flight=$DREMIO_FLIGHT_PORT fabric=$DREMIO_FABRIC_PORT zk=$DREMIO_ZK_PORT"
 # Start in a clean environment slice: S3/Polaris secrets are not needed by the Dremio process.
-env -u S3_SECRET_KEY -u AWS_SECRET_ACCESS_KEY -u MINIO_SECRET_KEY -u POLARIS_ROOT_SECRET \
+# Every AWS credential variable is removed, access key IDs included: Dremio's S3 file system falls
+# back to AWS_ACCESS_KEY_ID/AWS_ACCESS_KEY + AWS_SECRET_ACCESS_KEY/AWS_SECRET_KEY when a source has
+# no S3 credentials (empty provider), which would defeat the "no credentials" scenarios.
+env -u S3_ACCESS_KEY -u S3_SECRET_KEY -u MINIO_SECRET_KEY -u POLARIS_ROOT_SECRET \
+  -u AWS_ACCESS_KEY_ID -u AWS_ACCESS_KEY -u AWS_SECRET_ACCESS_KEY -u AWS_SECRET_KEY \
+  -u AWS_SESSION_TOKEN -u AWS_PROFILE \
   JAVA_HOME="$DREMIO_JAVA_HOME" "$DREMIO_HOME_DIR/bin/dremio" start >/dev/null
 
 web_up() { curl -sf --max-time 2 -o /dev/null "$DREMIO_URL/apiv2/server_status"; }

@@ -22,7 +22,7 @@
               },
               {
                 "propName": "config.isUsingVendedCredentials",
-                "tooltip": "Asks the catalog for vended storage credentials (header X-Iceberg-Access-Delegation: vended-credentials). Dremio OSS does not use vended credentials to read data yet, so also configure storage access under Advanced Options."
+                "tooltip": "Asks the catalog for vended storage credentials (header X-Iceberg-Access-Delegation: vended-credentials) and accesses the files of each table with the S3 credentials the catalog returns for it. The endpoint and other S3 connection settings still come from the storage properties under Advanced Options; tables without vended credentials use the storage credentials configured there."
               }
             ],
             "help": {

@@ -8,12 +8,13 @@ runner:
 default_profile: fast
 profiles:
   fast:
-    steps: [icebergcatalog-test, icebergcatalog-lint]
+    steps: [icebergcatalog-test, s3-test, icebergcatalog-lint]
   full:
-    steps: [icebergcatalog-test, icebergcatalog-lint, icebergcatalog-static, ui-source-specs, e2e-harness-lint]
+    steps: [icebergcatalog-test, s3-test, icebergcatalog-lint, icebergcatalog-static, ui-source-specs, e2e-harness-lint]
 # The server accepts at most 32 MiB / 10000 tar entries, and localci archives every
-# directory (including ignored target/ trees). Steps build only plugins/icebergcatalog and
-# dac/ui; other modules resolve from ~/.m2 and need only their pom.xml in the archive.
+# directory (including ignored target/ trees). Steps build only plugins/icebergcatalog,
+# plugins/s3 and dac/ui; other modules resolve from ~/.m2 and need only their pom.xml in the
+# archive.
 # Keep root src/: the root pom puts src/test/log-config (logback-test.xml) on the surefire
 # classpath; without it tests log at DEBUG.
 archive_exclude:
@@ -113,7 +114,6 @@ archive_exclude:
   - plugins/nas/target
   - plugins/pdfs/src
   - plugins/pdfs/target
-  - plugins/s3/src
   - plugins/s3/target
   - plugins/sysflight/src
   - plugins/sysflight/target
@@ -315,20 +315,30 @@ steps:
     artifacts:
       - plugins/icebergcatalog/target/surefire-reports/*.xml
       - plugins/icebergcatalog/target/surefire-reports/*.txt
+  # Compile and run every test of plugins/s3 (Dremio's S3 file system, changed in Phase 4 for
+  # endpoints with a scheme). plugins/icebergcatalog uses it as a test-scope dependency resolved
+  # from ~/.m2; this step tests the working tree's S3 code itself.
+  - name: s3-test
+    commands:
+      - ./mvnw -o -B -ntp -Ddremio.no-ui -Ddremio.no-lint -Derrorprone.skip -Dmaven.gitcommitid.skip=true -Dmaven.test.redirectTestOutputToFile=true -pl plugins/s3 test
+    timeout: 30m
+    artifacts:
+      - plugins/s3/target/surefire-reports/*.xml
+      - plugins/s3/target/surefire-reports/*.txt
   # Same checks as `scripts/dev lint`: google-java-format, sortpom, license headers, checkstyle.
   - name: icebergcatalog-lint
     commands:
-      - ./mvnw -o -B -ntp -Ddremio.no-ui -Dmaven.gitcommitid.skip=true -pl plugins/icebergcatalog spotless:check license:check checkstyle:check
+      - ./mvnw -o -B -ntp -Ddremio.no-ui -Dmaven.gitcommitid.skip=true -pl plugins/icebergcatalog,plugins/s3 spotless:check license:check checkstyle:check
     timeout: 15m
   # errorprone, forbiddenapis and enforcer, which the fast flags skip but upstream CI runs.
   # Falls back to online mode when the errorprone toolchain is not in ~/.m2 yet. The sources are
   # touched first: icebergcatalog-test already compiled them without errorprone, and an up-to-date
   # module would otherwise skip compilation (and errorprone) entirely.
   - name: icebergcatalog-static
-    depends_on: [icebergcatalog-test]
+    depends_on: [icebergcatalog-test, s3-test]
     commands:
-      - find plugins/icebergcatalog/src -name '*.java' -exec touch {} +
-      - ./mvnw -o -B -ntp -Ddremio.no-ui -Dmaven.gitcommitid.skip=true -DskipTests -pl plugins/icebergcatalog verify || ./mvnw -B -ntp -Ddremio.no-ui -Dmaven.gitcommitid.skip=true -DskipTests -pl plugins/icebergcatalog verify
+      - find plugins/icebergcatalog/src plugins/s3/src -name '*.java' -exec touch {} +
+      - ./mvnw -o -B -ntp -Ddremio.no-ui -Dmaven.gitcommitid.skip=true -DskipTests -pl plugins/s3,plugins/icebergcatalog verify || ./mvnw -B -ntp -Ddremio.no-ui -Dmaven.gitcommitid.skip=true -DskipTests -pl plugins/s3,plugins/icebergcatalog verify
     timeout: 30m
   # Mocha specs for the source forms. Reuses the dev checkout's installed node_modules
   # (DREMIO_NODE_MODULES) because the archive carries no node_modules, and the Node 22 + pnpm

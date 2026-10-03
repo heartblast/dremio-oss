@@ -66,6 +66,7 @@ import com.dremio.io.file.FileSystem;
 import com.dremio.io.file.Path;
 import com.dremio.options.OptionManager;
 import com.dremio.options.TypeValidators.BooleanValidator;
+import com.dremio.plugins.icebergcatalog.dfs.DatasetFileSystemCache;
 import com.dremio.sabot.exec.context.OperatorContext;
 import com.dremio.service.namespace.NamespaceAttribute;
 import com.dremio.service.namespace.NamespaceKey;
@@ -75,6 +76,7 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Suppliers;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import java.io.IOException;
@@ -114,6 +116,7 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.Namespace;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.exceptions.BadRequestException;
 import org.apache.iceberg.exceptions.ForbiddenException;
@@ -143,6 +146,22 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
 
   /** Access delegation mode requested when vended credentials are enabled. */
   public static final String VENDED_CREDENTIALS_DELEGATION_MODE = "vended-credentials";
+
+  /** Hadoop S3A property naming the AWS credentials provider of Dremio's S3 file system. */
+  @VisibleForTesting
+  static final String S3A_CREDENTIALS_PROVIDER = "fs.s3a.aws.credentials.provider";
+
+  /**
+   * Hadoop's built-in value of {@link #S3A_CREDENTIALS_PROVIDER} (core-default.xml): a chain of
+   * providers. Dremio copies the {@code fs.*} defaults into every file system configuration.
+   */
+  private static final Supplier<String> HADOOP_DEFAULT_CREDENTIALS_PROVIDER =
+      Suppliers.memoize(
+          () -> {
+            Configuration defaults = new Configuration(false);
+            defaults.addResource("core-default.xml");
+            return defaults.getTrimmed(S3A_CREDENTIALS_PROVIDER);
+          });
 
   /**
    * Property keys (lower case) whose values are secrets and therefore belong in the secret property
@@ -178,7 +197,12 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
           "resource",
           "token-exchange-enabled",
           "token-refresh-enabled",
-          "token-expires-in-ms");
+          "token-expires-in-ms",
+          // AWS SigV4 signing of REST requests (rest.sigv4-enabled): credentials of the REST
+          // client, not of the storage.
+          "rest.access-key-id",
+          "rest.secret-access-key",
+          "rest.session-token");
 
   /**
    * Prefixes (lower case) of REST-client-only property keys, see above. {@code rest.client.} covers
@@ -240,6 +264,12 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
 
   /** Whether {@link #start()} was called on this instance. */
   private volatile boolean started;
+
+  /**
+   * Per-table storage credentials vended by the catalog. Null unless the source uses vended
+   * credentials (created with the file system cache in {@link #start()}).
+   */
+  private volatile VendedCredentialsCache vendedCredentials;
 
   public RestIcebergCatalogPlugin(
       RestIcebergCatalogPluginConfig pluginConfig,
@@ -406,13 +436,158 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
     }
     if (isUsingVendedCredentials) {
       logger.info(
-          "Iceberg REST catalog source {} requests vended credentials ({}={}). Data files are"
-              + " still accessed with the storage properties configured on the source.",
+          "Iceberg REST catalog source {} requests vended credentials ({}={}). Table files are"
+              + " accessed with the S3 credentials the catalog vends for each table; tables"
+              + " without vended credentials use the storage properties of the source. Endpoint,"
+              + " region and other connection settings always come from the source.",
           name,
           ACCESS_DELEGATION_HEADER_PROPERTY,
           VENDED_CREDENTIALS_DELEGATION_MODE);
     }
     super.start();
+  }
+
+  /**
+   * With vended credentials, file systems are created and cached per table, with the credentials
+   * the catalog vends for that table (see {@link #getFsConfForDataset}).
+   */
+  @Override
+  protected DatasetFileSystemCache createFSCache() {
+    if (!isUsingVendedCredentials) {
+      return super.createFSCache();
+    }
+    vendedCredentials =
+        new VendedCredentialsCache(this::loadVendedTableProperties, name, this::redactSecrets);
+    return new DatasetFileSystemCache(this::getFsConfForDataset, optionManager, true);
+  }
+
+  /**
+   * The FileIO properties the catalog returns for the table, without the source's own catalog
+   * properties (the Iceberg REST client merges them in). Credentials for a table that does not
+   * exist yet come from a staged creation only if the source has no S3 credentials of its own: a
+   * source with static keys writes new tables with them, as it does without vended credentials,
+   * also outside the catalog's default table location.
+   */
+  private Map<String, String> loadVendedTableProperties(TableIdentifier table) {
+    boolean stageNewTable = !hasOwnS3Credentials(getFsConfCopy());
+    return withoutSourceProperties(
+        getCatalogAccessor().loadTableStorageProperties(table, stageNewTable), configPropertyList);
+  }
+
+  /**
+   * Removes the entries that are the source's own catalog properties (same key and value). The
+   * Iceberg REST client builds a table's FileIO properties from the catalog properties, which
+   * include every source property, merged with the table config of the catalog's response; e.g.
+   * {@code s3.access-key-id} configured on the source must not be taken for a vended credential.
+   */
+  @VisibleForTesting
+  static Map<String, String> withoutSourceProperties(
+      Map<String, String> tableProperties, List<Property> sourceProperties) {
+    if (tableProperties.isEmpty() || sourceProperties.isEmpty()) {
+      return tableProperties;
+    }
+    Map<String, String> result = new HashMap<>(tableProperties);
+    for (Property p : sourceProperties) {
+      result.remove(p.name, p.value);
+    }
+    return result;
+  }
+
+  /**
+   * Whether the given file system configuration of the source carries S3 credentials of its own: an
+   * access key, or a credentials provider that needs none (e.g. an instance profile or an assumed
+   * role). Hadoop's built-in provider chain, which Dremio's S3 file system rejects, and the
+   * key-based providers without a key do not count.
+   */
+  @VisibleForTesting
+  static boolean hasOwnS3Credentials(Configuration conf) {
+    if (hasS3AccessKey(conf)) {
+      return true;
+    }
+    String provider = conf.getTrimmed(S3A_CREDENTIALS_PROVIDER);
+    return StringUtils.isNotEmpty(provider)
+        && !provider.equals(HADOOP_DEFAULT_CREDENTIALS_PROVIDER.get())
+        && !VendedStorageCredentials.SIMPLE_CREDENTIALS_PROVIDER.equals(provider)
+        && !VendedStorageCredentials.TEMPORARY_CREDENTIALS_PROVIDER.equals(provider);
+  }
+
+  /** Whether an S3 access key is set, for all buckets or for one. */
+  private static boolean hasS3AccessKey(Configuration conf) {
+    if (StringUtils.isNotBlank(conf.getTrimmed(VendedStorageCredentials.FS_S3A_ACCESS_KEY))) {
+      return true;
+    }
+    for (Map.Entry<String, String> e :
+        conf.getPropsWithPrefix(VendedStorageCredentials.FS_S3A_BUCKET_PREFIX).entrySet()) {
+      if (e.getKey().endsWith(".access.key") && StringUtils.isNotBlank(e.getValue())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Forgets the vended credentials of a table on this node, and the file systems created with them,
+   * after the table was created or dropped: a table created again under the same name may live
+   * elsewhere, and the credentials of a new table (or their absence) were looked up before it
+   * existed. Other nodes replace theirs when they expire.
+   */
+  private void forgetTableStorage(List<String> dataset) {
+    VendedCredentialsCache credentialsCache = vendedCredentials;
+    TableIdentifier table = tableIdentifierOf(dataset);
+    if (credentialsCache == null || table == null) {
+      return;
+    }
+    credentialsCache.invalidate(table);
+    DatasetFileSystemCache fsCache = getHadoopFileSystemCache();
+    if (fsCache != null) {
+      fsCache.invalidateDatasets(other -> table.equals(tableIdentifierOf(other)));
+    }
+  }
+
+  /**
+   * The configuration of a file system for the given dataset (full table path, its first element
+   * may be null): the source's configuration, with the S3 credentials the catalog vends for the
+   * table if it vends any. The file system is replaced shortly before the credentials expire (see
+   * {@link DatasetFileSystemCache#FS_EXPIRES_AT_MILLIS}).
+   */
+  @VisibleForTesting
+  Configuration getFsConfForDataset(@Nullable List<String> dataset) {
+    Configuration conf = getFsConfCopy();
+    VendedCredentialsCache credentialsCache = vendedCredentials;
+    TableIdentifier table = tableIdentifierOf(dataset);
+    if (credentialsCache == null || table == null) {
+      return conf;
+    }
+    VendedCredentialsCache.Result result = credentialsCache.get(table);
+    result.getCredentials().ifPresent(credentials -> credentials.applyTo(conf));
+    conf.setLong(DatasetFileSystemCache.FS_EXPIRES_AT_MILLIS, result.getValidUntilMillis());
+    return conf;
+  }
+
+  /** The table of a dataset path (source, namespace levels, table name), or null if it is none. */
+  @VisibleForTesting
+  @Nullable
+  static TableIdentifier tableIdentifierOf(@Nullable List<String> dataset) {
+    if (dataset == null || dataset.size() < 3) {
+      return null;
+    }
+    List<String> levels = dataset.subList(1, dataset.size());
+    if (levels.contains(null)) {
+      return null;
+    }
+    return TableIdentifier.of(levels.toArray(new String[0]));
+  }
+
+  @Override
+  public void close() throws Exception {
+    try {
+      super.close();
+    } finally {
+      VendedCredentialsCache credentialsCache = vendedCredentials;
+      if (credentialsCache != null) {
+        credentialsCache.invalidateAll();
+      }
+    }
   }
 
   /**
@@ -426,10 +601,35 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
   @VisibleForTesting
   void applyConfigPropertiesToFsConf(Configuration conf) {
     conf.set(IcebergUtils.ENABLE_AZURE_ABFSS_SCHEME, "true");
+    replaceHadoopDefaultCredentialsProvider(conf);
     for (Property p : configPropertyList) {
       if (!isRestClientOnlyPropertyKey(p.name)) {
         conf.set(p.name, p.value);
       }
+    }
+  }
+
+  /**
+   * Replaces Hadoop's built-in value of {@code fs.s3a.aws.credentials.provider} with {@code
+   * SimpleAWSCredentialsProvider} (access keys). The built-in value (core-default.xml) is a
+   * comma-separated chain of providers that Dremio copies into every file system configuration.
+   * Dremio's S3 client rejects it ("Invalid AWSCredentialsProvider provided": it takes exactly one
+   * provider), while Hadoop S3A, which Dremio uses for metadata and writes, would walk it and fall
+   * back to the Dremio host's identity (the {@code AWS_*} environment variables, the EC2 instance
+   * profile) when the source has no keys.
+   *
+   * <p>With the replacement, a source with an access key works without setting the provider, and a
+   * source (or a table without vended credentials) with no S3 credentials fails on both clients
+   * instead of using the host's identity. A provider set on the source is applied afterwards and
+   * wins, including an empty value, with which Dremio derives the provider ({@code
+   * FileSystemConfUtil}: access keys, else the {@code AWS_*} environment variables, else the EC2
+   * instance profile). Any other value, e.g. one set in core-site.xml, is kept.
+   */
+  @VisibleForTesting
+  static void replaceHadoopDefaultCredentialsProvider(Configuration conf) {
+    String value = conf.getTrimmed(S3A_CREDENTIALS_PROVIDER);
+    if (value != null && value.equals(HADOOP_DEFAULT_CREDENTIALS_PROVIDER.get())) {
+      conf.set(S3A_CREDENTIALS_PROVIDER, VendedStorageCredentials.SIMPLE_CREDENTIALS_PROVIDER);
     }
   }
 
@@ -1066,6 +1266,7 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
     getCatalogAccessor()
         .createTable(
             tablePathComponents, schema, partitionSpec, sortOrder, tableLocation, tableProperties);
+    forgetTableStorage(tablePathComponents);
 
     IcebergMetrics.countFormatVersion(
         IcebergFeatureManager.getIcebergFormatVersion(tableProperties).getValue(),
@@ -1099,6 +1300,8 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
     String tableFolderLocation;
 
     if (isCTAS) {
+      // A table dropped earlier under this name may have left its credentials behind.
+      forgetTableStorage(dataset);
       tableFolderLocation = getNewTableLocationFromCatalog(writerOptions, dataset);
       if (tableFolderLocation == null) {
         throw UserException.validationError()
@@ -1158,6 +1361,7 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
       throw new CatalogEntityNotFoundException(
           String.format("Table %s not found", tableSchemaPath.getName()));
     }
+    forgetTableStorage(tableSchemaPath.getPathComponents());
   }
 
   @Override
