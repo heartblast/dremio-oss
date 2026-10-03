@@ -568,6 +568,30 @@ public class TestRestIcebergCatalogPluginConfig extends BaseTestQuery {
     assertFalse(existing.equalsIgnoringNotMetadataImpacting(updated));
   }
 
+  /**
+   * ManagedStoragePlugin.replacePlugin skips the plugin restart only when ConnectionConf.equals
+   * holds. Changing a cache setting alone keeps the metadata (equalsIgnoringNotMetadataImpacting)
+   * but is not equal, so the source update starts a new plugin, which re-reads the
+   * plugins.restcatalog.* options.
+   */
+  @Test
+  public void testCacheSettingChangeRestartsPluginButKeepsMetadata() {
+    RestIcebergCatalogPluginConfig existing = newPolarisConfig();
+
+    RestIcebergCatalogPluginConfig cachingOff = newPolarisConfig();
+    cachingOff.isCachingEnabled = false;
+    assertNotEquals(existing, cachingOff);
+    assertTrue(existing.equalsIgnoringNotMetadataImpacting(cachingOff));
+
+    RestIcebergCatalogPluginConfig halfCache = newPolarisConfig();
+    halfCache.maxCacheSpacePct = 50;
+    assertNotEquals(existing, halfCache);
+    assertTrue(existing.equalsIgnoringNotMetadataImpacting(halfCache));
+
+    // The same settings sent again are equal: no restart.
+    assertEquals(existing, newPolarisConfig());
+  }
+
   @Test
   public void testPersistedTagsAreStable() {
     Map<String, Integer> expected = new HashMap<>();

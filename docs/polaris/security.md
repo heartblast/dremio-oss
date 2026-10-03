@@ -114,6 +114,8 @@ Dremio fork 1.7 `org.apache.iceberg.rest.HTTPClient`와 `ExponentialHttpRequestR
 | HttpClient 4 header logger, Netty `LoggingHandler` | DEBUG에서 `X-Amz-Security-Token`이 찍힌다 | Phase 4에서 `logback.xml`에 INFO 고정 (§3. Netty는 review). 나열하지 않은 logger는 막지 않는다 |
 | S3 credential이 없는 source/table의 host identity | Phase 4 review 이전 작업 트리는 provider chain을 빈 값으로 바꿔, key가 없으면 Dremio host의 `AWS_*` env 또는 EC2 instance profile을 조용히 썼다 (vended 조회 실패/403/vending 없음 table 포함). Hadoop 기본 chain을 그대로 둬도 S3A가 env/instance profile까지 시도한다 | Review 반영: 기본 chain을 `SimpleAWSCredentialsProvider`로 바꿔 fail closed (§7.4). host identity는 provider를 빈 값/명시 provider로 지정할 때만 |
 | Harness `docker inspect` | Polaris container env에 MinIO secret과 bootstrap credential이 보인다 (harness가 env로 넘긴다) | 로컬 test 전용. 운영 Polaris는 secret store/IAM role을 쓴다 |
+| Client secret 회수/rotate (Phase 5 F-7) | Polaris principal secret을 바꿔도 실행 중 source는 계속 동작한다. Iceberg OAuth2 session이 client secret 없이 token을 갱신하고, 새 client(Dremio 재시작, 설정 변경 update)를 만들 때만 실패한다. `token-exchange-enabled=false`도 차이 없음 | 회수를 즉시 반영하려면 Polaris grant/principal role도 회수하고 source를 update하거나 Dremio를 재시작한다 (known-limitations X-09) |
+| Phase 5 secret scan | 7개 instance의 Dremio log, Polaris/proxy/fixture/MinIO container log, UI HTTP 응답 150개와 page에서 secret, `Bearer`, `access_token`, `client_secret`, `s3.secret-access-key`, `s3.session-token`, `eyJ` 0건 | [test-results.md §5](test-results.md#5-phase-5--실제-e2e--regression) |
 
 ## 7. Phase 4: storage secret 처리 결과
 

@@ -64,6 +64,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
@@ -1045,8 +1046,41 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
     } catch (ForbiddenException e) {
       throw forbidden(e, "create table", bracket(tableIdentifierFromDataset(dataset)));
     }
+    final TableIdentifier tableIdentifier = tableIdentifierFromDataset(dataset);
     return new ForbiddenMappingTableOperations(
-        (DremioFileIO) fileIO, stagedCreate, dataset, redactor);
+        (DremioFileIO) fileIO,
+        stagedCreate,
+        dataset,
+        redactor,
+        metadata -> stagedCreateOperations(tableIdentifier, metadata));
+  }
+
+  /**
+   * Stages the creation of a table with the partition spec, sort order, location and properties of
+   * the metadata that CTAS commits.
+   *
+   * <p>CTAS first stages the table with only its schema and then commits fresh table metadata
+   * ({@code IcebergBaseCommand#beginCreateTableTransaction}). The Iceberg REST client sends the
+   * changes of the staged table (unpartitioned spec 0, set as default) followed by the changes of
+   * the committed metadata. The latter add the partition spec but do not set it as the default,
+   * because a new table's metadata builder already starts with default spec id 0. The catalog then
+   * creates the table with the partition spec as spec 1 and keeps the unpartitioned spec 0 as the
+   * default (seen with Apache Polaris). Staging with the committed spec avoids that: spec 0 is the
+   * partition spec, and the committed changes reuse it.
+   */
+  protected TableOperations stagedCreateOperations(
+      TableIdentifier tableIdentifier, TableMetadata metadata) {
+    final Transaction transaction =
+        getCatalog()
+            .buildTable(tableIdentifier, metadata.schema())
+            .withPartitionSpec(metadata.spec())
+            .withSortOrder(metadata.sortOrder())
+            .withLocation(metadata.location())
+            .withProperties(metadata.properties())
+            .createTransaction();
+    Preconditions.checkState(
+        transaction instanceof BaseTransaction, "Error - Plugin does not support this operation.");
+    return ((BaseTransaction) transaction).underlyingOps();
   }
 
   protected TableOperations tableOperationsHelperForCtas(List<String> dataset, Schema schema) {
@@ -1164,21 +1198,55 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
   static final class ForbiddenMappingTableOperations extends DremioRESTTableOperations {
     private final List<String> dataset;
     private final UnaryOperator<String> redactor;
+    // CTAS only: stages the creation again with the metadata to commit (see
+    // stagedCreateOperations).
+    @Nullable private final Function<TableMetadata, TableOperations> restagedCreate;
+    @Nullable private volatile TableOperations committedCreate;
 
     ForbiddenMappingTableOperations(
         DremioFileIO dremioFileIO,
         TableOperations delegate,
         List<String> dataset,
         UnaryOperator<String> redactor) {
+      this(dremioFileIO, delegate, dataset, redactor, null);
+    }
+
+    ForbiddenMappingTableOperations(
+        DremioFileIO dremioFileIO,
+        TableOperations delegate,
+        List<String> dataset,
+        UnaryOperator<String> redactor,
+        @Nullable Function<TableMetadata, TableOperations> restagedCreate) {
       super(dremioFileIO, delegate);
       this.dataset = dataset;
       this.redactor = redactor;
+      this.restagedCreate = restagedCreate;
+    }
+
+    @Override
+    public TableMetadata current() {
+      final TableOperations created = committedCreate;
+      return created != null ? created.current() : super.current();
+    }
+
+    @Override
+    public TableMetadata refresh() {
+      final TableOperations created = committedCreate;
+      return created != null ? created.refresh() : super.refresh();
     }
 
     @Override
     public void commit(TableMetadata base, TableMetadata metadata) {
       try {
-        super.commit(base, metadata);
+        if (base == null && restagedCreate != null && metadata.spec().isPartitioned()) {
+          // A partitioned CTAS: commit through a creation staged with its partition spec, or the
+          // catalog keeps the staged unpartitioned spec as the default.
+          final TableOperations created = restagedCreate.apply(metadata);
+          created.commit(null, metadata);
+          committedCreate = created;
+        } else {
+          super.commit(base, metadata);
+        }
       } catch (ForbiddenException e) {
         throw new CommitForbiddenException(
             RestCatalogExceptionMapper.forbidden(

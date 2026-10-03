@@ -294,4 +294,17 @@ public class TestRestCatalogLayout {
         "layout should mention 'PRINCIPAL_ROLE:ALL'", layoutText.contains("PRINCIPAL_ROLE:ALL"));
     assertTrue("layout should mention 'credential'", layoutText.contains("credential"));
   }
+
+  @Test
+  public void testHelpTextRecommendsS3aRegionForS3CompatibleStorage() {
+    // S3A signs with fs.s3a.endpoint.region; dremio.s3.region alone fails against an
+    // S3-compatible store outside us-east-1 (storage.md), so the help text must not suggest it as
+    // the region setting.
+    assertTrue(
+        "layout should recommend 'fs.s3a.endpoint.region=<region>'",
+        layoutText.contains("fs.s3a.endpoint.region=<region>"));
+    assertFalse(
+        "layout should not recommend 'dremio.s3.region=<region>'",
+        layoutText.contains("dremio.s3.region=<region>"));
+  }
 }

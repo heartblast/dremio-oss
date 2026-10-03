@@ -71,7 +71,7 @@
             ],
             "help": {
               "position": "bottom",
-              "text": "Passed to the Iceberg REST client and to the storage layer. Apache Polaris requires warehouse=<catalog-name> and scope=PRINCIPAL_ROLE:ALL (or PRINCIPAL_ROLE:<role>); oauth2-server-uri=http://<polaris-host>:8181/api/catalog/v1/oauth/tokens is recommended. For MinIO or other S3-compatible storage add fs.s3a.endpoint=<host>:<port> (no scheme), fs.s3a.path.style.access=true, fs.s3a.connection.ssl.enabled=false, dremio.s3.compat=true, fs.s3a.requester.pays.enabled=false, dremio.bucket.discovery.enabled=false and dremio.s3.region=<region>. Values here are not masked: put secrets under Catalog Credentials."
+              "text": "Passed to the Iceberg REST client and to the storage layer. Apache Polaris requires warehouse=<catalog-name> and scope=PRINCIPAL_ROLE:ALL (or PRINCIPAL_ROLE:<role>); oauth2-server-uri=http://<polaris-host>:8181/api/catalog/v1/oauth/tokens is recommended. For MinIO or other S3-compatible storage add fs.s3a.endpoint=<host>:<port>, fs.s3a.path.style.access=true, dremio.s3.compat=true and, for plain HTTP, fs.s3a.connection.ssl.enabled=false; if the storage region is not us-east-1, also add fs.s3a.endpoint.region=<region> (dremio.s3.region alone is not enough). Values here are not masked: put secrets under Catalog Credentials."
             }
           },
           {

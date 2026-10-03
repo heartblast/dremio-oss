@@ -1028,6 +1028,16 @@ public class TestRestCatalogHttpErrors extends BaseTestQuery {
     private void serve(Socket socket) {
       try (Socket s = socket) {
         s.setSoTimeout(10_000);
+        if (s instanceof javax.net.ssl.SSLSocket) {
+          try {
+            // Handshake explicitly: a client that rejects the certificate may end it with an
+            // alert, a reset or EOF, and only the alert surfaces as SSLException on read.
+            ((javax.net.ssl.SSLSocket) s).startHandshake();
+          } catch (IOException e) {
+            tlsFailures.incrementAndGet();
+            return;
+          }
+        }
         InputStream in = new BufferedInputStream(s.getInputStream());
         if (!(s instanceof javax.net.ssl.SSLSocket)) {
           in.mark(1);

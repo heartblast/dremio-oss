@@ -22,12 +22,14 @@ import static com.dremio.exec.store.IcebergCatalogPluginOptions.RESTCATALOG_PLUG
 import static com.dremio.exec.store.IcebergCatalogPluginOptions.RESTCATALOG_PLUGIN_VIEW_CACHE_ENABLED;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -40,6 +42,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
+import org.apache.iceberg.BaseTransaction;
+import org.apache.iceberg.MetadataUpdate;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SortOrder;
@@ -647,5 +651,103 @@ public class TestRestCatalogNamespaceTableOps {
             t ->
                 assertUserException(
                     t, ErrorType.PERMISSION, "create table [ns1.c1]", "CREATE_TABLE_STAGED"));
+  }
+
+  // --- CTAS (staged create) ---
+
+  private BaseTransaction stagedCreate(TableOperations ops) {
+    BaseTransaction transaction = mock(BaseTransaction.class);
+    when(transaction.underlyingOps()).thenReturn(ops);
+    return transaction;
+  }
+
+  @Test
+  public void testPartitionedCtasCommitsThroughCreationStagedWithItsSpec() throws Exception {
+    Schema schema =
+        new Schema(
+            Types.NestedField.optional(1, "id", Types.IntegerType.get()),
+            Types.NestedField.optional(2, "region", Types.StringType.get()));
+    TableMetadata metadata =
+        TableMetadata.newTableMetadata(
+            schema,
+            PartitionSpec.builderFor(schema).identity("region").build(),
+            SortOrder.unsorted(),
+            "s3://bucket/ns1/c1",
+            Collections.emptyMap());
+    // The cause: fresh table metadata adds the partition spec without setting it as the default
+    // (a new table starts with default spec id 0), so committing it on top of the creation staged
+    // with only the schema left the unpartitioned spec as the default.
+    assertThat(metadata.changes())
+        .noneMatch(change -> change instanceof MetadataUpdate.SetDefaultPartitionSpec);
+
+    TableIdentifier identifier = TableIdentifier.of("ns1", "c1");
+    TableOperations schemaOnlyStage = mockRestTableOperations();
+    BaseTransaction schemaOnlyTransaction = stagedCreate(schemaOnlyStage);
+    when(catalog.newCreateTableTransaction(identifier, SCHEMA)).thenReturn(schemaOnlyTransaction);
+    TableOperations specStage = mockRestTableOperations();
+    TableMetadata committed = mock(TableMetadata.class);
+    when(specStage.current()).thenReturn(committed);
+    Catalog.TableBuilder builder = mock(Catalog.TableBuilder.class, RETURNS_SELF);
+    BaseTransaction specTransaction = stagedCreate(specStage);
+    when(builder.createTransaction()).thenReturn(specTransaction);
+    when(catalog.buildTable(identifier, metadata.schema())).thenReturn(builder);
+
+    TableOperations ops =
+        accessor.createIcebergTableOperationsForCtas(
+            mock(DremioFileIO.class), path("ns1", "c1"), SCHEMA, null, null);
+    ops.commit(null, metadata);
+
+    verify(builder).withPartitionSpec(metadata.spec());
+    verify(builder).withSortOrder(metadata.sortOrder());
+    verify(builder).withLocation("s3://bucket/ns1/c1");
+    verify(builder).withProperties(metadata.properties());
+    verify(specStage).commit(null, metadata);
+    verify(schemaOnlyStage, never()).commit(any(), any());
+    assertThat(ops.current()).isSameAs(committed);
+  }
+
+  @Test
+  public void testUnpartitionedCtasCommitsThroughSchemaOnlyStage() throws Exception {
+    TableMetadata metadata =
+        TableMetadata.newTableMetadata(
+            SCHEMA, PartitionSpec.unpartitioned(), "s3://bucket/ns1/c1", Collections.emptyMap());
+    TableIdentifier identifier = TableIdentifier.of("ns1", "c1");
+    TableOperations schemaOnlyStage = mockRestTableOperations();
+    BaseTransaction schemaOnlyTransaction = stagedCreate(schemaOnlyStage);
+    when(catalog.newCreateTableTransaction(identifier, SCHEMA)).thenReturn(schemaOnlyTransaction);
+
+    TableOperations ops =
+        accessor.createIcebergTableOperationsForCtas(
+            mock(DremioFileIO.class), path("ns1", "c1"), SCHEMA, null, null);
+    ops.commit(null, metadata);
+
+    verify(schemaOnlyStage).commit(null, metadata);
+    verify(catalog, never()).buildTable(any(), any());
+  }
+
+  @Test
+  public void testPartitionedCtasRestageForbiddenIsPermissionError() throws Exception {
+    Schema schema = new Schema(Types.NestedField.optional(1, "region", Types.StringType.get()));
+    TableMetadata metadata =
+        TableMetadata.newTableMetadata(
+            schema,
+            PartitionSpec.builderFor(schema).identity("region").build(),
+            "s3://bucket/ns1/c1",
+            Collections.emptyMap());
+    TableIdentifier identifier = TableIdentifier.of("ns1", "c1");
+    BaseTransaction schemaOnlyTransaction = stagedCreate(mockRestTableOperations());
+    when(catalog.newCreateTableTransaction(identifier, SCHEMA)).thenReturn(schemaOnlyTransaction);
+    Catalog.TableBuilder builder = mock(Catalog.TableBuilder.class, RETURNS_SELF);
+    when(builder.createTransaction())
+        .thenThrow(new ForbiddenException(POLARIS_GRANT_403, "CREATE_TABLE_STAGED"));
+    when(catalog.buildTable(identifier, metadata.schema())).thenReturn(builder);
+
+    TableOperations ops =
+        accessor.createIcebergTableOperationsForCtas(
+            mock(DremioFileIO.class), path("ns1", "c1"), SCHEMA, null, null);
+
+    assertThatThrownBy(() -> ops.commit(null, metadata))
+        .isInstanceOf(AbstractRestCatalogAccessor.CommitForbiddenException.class)
+        .hasMessageContaining("CREATE_TABLE_STAGED");
   }
 }

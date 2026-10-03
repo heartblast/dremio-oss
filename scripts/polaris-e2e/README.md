@@ -41,7 +41,7 @@ export S3_PREFIX=polaris-p3-$INSTANCE  # 선택. 기본값 polaris-e2e-$INSTANCE
 | `polaris-api.sh` | Polaris token을 발급받아 Iceberg REST / Management API를 호출한다 (`raw`, `ns-list`, `ns-create`, `ns-drop`, `tables`, `views`, `table-create`, `table-get`, `table-drop`, `--as <principal>`) |
 | `dremio-up.sh [--reuse]` / `dremio-down.sh [--purge]` | Dremio 시작/중지. `--reuse`는 기존 복사본과 data를 유지한다 (재시작 test). `--purge`는 `$WORK/dremio`를 삭제한다 |
 | `source.sh` | `create`, `update`, `get`, `ls <path>`, `wait <path> <child> [sec]`, `delete`, `json` (`json`은 secret을 placeholder로 바꿔 출력만 한다). `delete`는 root listing에서 id를 찾으므로 state가 `bad`인 source도 지운다 |
-| `sql.sh` | `/api/v3/sql`로 실행하고 job이 끝날 때까지 기다린 뒤 state와 결과 row를 출력한다. COMPLETED가 아니면 exit 1 |
+| `sql.sh` | `/api/v3/sql`로 실행하고 job이 끝날 때까지 기다린 뒤 state와 결과 row를 출력한다. COMPLETED면 항상 `/results`를 읽는다 (`SHOW`/`DESCRIBE`처럼 coordinator에서 답하는 문장은 job의 `rowCount`가 0이어도 row가 있다). COMPLETED가 아니면 exit 1 |
 | `scan-secrets.sh [VAR...]` | Dremio log와 Polaris container log에서 secret 값과 token marker의 건수만 출력한다. 하나라도 있으면 exit 1 |
 | `s3.sh ls\|count\|clean` | `s3://$S3_BUCKET/$S3_PREFIX/` 아래 object를 조회하거나 삭제한다 (prefix는 `polaris-`로 시작해야 한다) |
 | `smoke.sh` | 위 script를 순서대로 실행하는 smoke test. `SMOKE_KEEP=1`이면 teardown하지 않는다 |
@@ -115,6 +115,6 @@ SOURCE_KEEP_SECRETS=1 SOURCE_VENDED=true ./source.sh update      # masked 값으
   - Source를 만들기 **전에** 있던 namespace는 생성 직후부터 보인다.
 - `/api/v3/catalog/{id}/refresh`는 source metadata refresh가 아니다 (dataset reflection refresh). Source에는 404를 반환한다.
 - Dremio `DROP TABLE`을 실행해도 S3 object는 남는다. 정리는 `s3.sh clean`으로 한다.
-- 잘못된 credential이나 `warehouse`가 빠진 source를 만들면 API 응답은 `HTTP 400 Could not connect to <name>, ...`뿐이다 (G-09). 원인 hint는 server.log에만 있다.
+- 잘못된 credential이나 `warehouse`가 빠진 source를 만들면 API는 HTTP 400을 돌려주고, Phase 3부터 `errorMessage`에 원인 hint와 redact된 detail이 들어 있다 (G-09). Dremio 재시작 때 시작에 실패한 source는 일반 메시지("Source is not currently available.")만 보이고 hint는 server.log에 있다.
 - `s3.sh`는 `@`나 `/`가 들어간 S3 credential을 지원하지 않는다. mc가 `MC_HOST`의 credential을 percent-decode하지 않기 때문이다.
 - `shellcheck`가 host에 없으면 `docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:stable -x *.sh`로 검사한다.

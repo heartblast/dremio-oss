@@ -3,7 +3,7 @@
 - Branch: `feature/polaris-restcatalog` (base: `799ccbda4 Release 26.0.5`)
 - 작업 정의: [`docs/reference_docs/catalog-support/polaris-catalog-support.md`](../reference_docs/catalog-support/polaris-catalog-support.md)
 - 상태 값: `PASS` / `FAIL` / `ENVIRONMENT_BLOCKED` / `NOT_SUPPORTED`. 진행 중인 항목은 `IN_PROGRESS`, 시작하지 않은 항목은 `NOT_STARTED`로 표시한다.
-- 최종 갱신: 2026-10-03 (Phase 4 Integration + review 반영)
+- 최종 갱신: 2026-10-03 (Phase 5 Integration)
 
 ## Phase 현황
 
@@ -12,9 +12,9 @@
 | 1 | 구조 분석 / Gap Analysis | PASS | [phase1-analysis.md](phase1-analysis.md), [compatibility-matrix.md](compatibility-matrix.md), progress.md | `67cf10e4c` |
 | 2 | RESTCATALOG OSS Source 완성 | PASS | `@SourceType`, `isUsingVendedCredentials`(tag 13), `restcatalog-layout.json`, Polaris preset, registration/round-trip test, live gate (아래 §Phase 2) | `f2553db4a` (후속 CI/log fix `ffd1cc1b2`) |
 | 3 | Polaris OAuth2 / Catalog 연동 | PASS | G-09/G-10/G-11/G-06 해결, 403/401 매핑, allowedNamespaces folder bug 수정, E2E harness `scripts/polaris-e2e`, [phase3-oauth-catalog.md](phase3-oauth-catalog.md), [security.md](security.md) | `3b85d3619` |
-| 4 | Object Storage | PASS | 공식 static baseline MinIO PASS (AWS는 ENVIRONMENT_BLOCKED), MinIO matrix, provider 생략/endpoint scheme 수정, vended credential runtime (G-04), HttpClient 4·Netty logger 고정, review 13건 반영, [storage.md](storage.md), [security.md](security.md) §7 | TBD |
-| 5 | 실제 E2E / Regression | NOT_STARTED | Dremio → Polaris → MinIO E2E, lifecycle, read/write, view, 장애 시나리오 | TBD |
-| 6 | 최종 통합 / 문서 / Release Readiness | NOT_STARTED | `design.md`, `configuration.md`, `storage.md`, `security.md`, `test-results.md`, `known-limitations.md` | TBD |
+| 4 | Object Storage | PASS | 공식 static baseline MinIO PASS (AWS는 ENVIRONMENT_BLOCKED), MinIO matrix, provider 생략/endpoint scheme 수정, vended credential runtime (G-04), HttpClient 4·Netty logger 고정, review 13건 반영, [storage.md](storage.md), [security.md](security.md) §7 | `691f2b5a9` |
+| 5 | 실제 E2E / Regression | PASS (commit 대기) | Dremio → Polaris → MinIO E2E 7개 instance (lifecycle, read, write, namespace/view, cache/metadata, 장애, regression, UI): PASS 139 / FAIL 8 (kernel K-01 3, known C-08 3, known K-15 1, minor 1) / NOT_SUPPORTED 5. partitioned CTAS 수정, layout help text 수정, harness `sql.sh` 수정, [test-results.md §5](test-results.md#5-phase-5--실제-e2e--regression), [known-limitations.md](known-limitations.md) | TBD (Lead) |
+| 6 | 최종 통합 / 문서 / Release Readiness | IN_PROGRESS | 문서 초안 작성됨: [design.md](design.md), [configuration.md](configuration.md), [test-results.md](test-results.md), [known-limitations.md](known-limitations.md). 남은 일은 §Phase 5 "Phase 6으로 넘기는 항목" | TBD |
 
 ## Phase 1 — 공통 완료 Gate
 
@@ -246,9 +246,9 @@ Phase 3 diff review finding 11건을 모두 확인(실제 문제)하고 반영�
 [x] secret/log 검토             (D live matrix 0건(KV 평문 G-12 제외), Integration INSTANCE=5와 review INSTANCE=6 scan 0건, `git diff`와 신규 파일에 MinIO secret 0건)
 [x] git diff/status 검토        (Integration Agent, review 반영 Agent)
 [x] 문서 갱신                   (storage.md 신규, security.md §1–§3·§6·§7, progress.md, compatibility-matrix.md)
-[ ] commit 완료                 (Lead)
-[ ] origin push 완료            (Lead)
-[ ] commit SHA 기록             (Phase 현황 표, TBD)
+[x] commit 완료                 (Lead, 691f2b5a9)
+[x] origin push 완료            (Lead, origin/feature/polaris-restcatalog = 691f2b5a9)
+[x] commit SHA 기록             (691f2b5a9)
 ```
 
 ### AbleOps Local CI
@@ -335,6 +335,95 @@ Phase 4 diff review finding 13건을 하나씩 code로 확인한 뒤 반영했�
 | 후속: UI | `ui-source-specs` | SUCCESS (103 passing, eslint 0 errors) |
 | 후속: harness | `e2e-harness-lint` | SUCCESS |
 
+## Phase 5 — 실제 E2E / Regression
+
+상세 결과(시나리오별 관찰값): [test-results.md §5](test-results.md#5-phase-5--실제-e2e--regression). 제약과 결함: [known-limitations.md](known-limitations.md).
+
+### 공통 완료 Gate
+
+```text
+[x] 병렬 Agent 작업 완료        (Prep 배포본+UI bundle, A Lifecycle, B Read, C Write+Namespace/View, E Cache/Metadata, F 장애/Regression, G UI, Docs 초안)
+[x] Integration 완료            (C의 partitioned CTAS 수정 검토/통합, layout help text 수정, flaky TLS test 수정, INSTANCE=7 재검증)
+[x] 신규 테스트 통과            (신규 5: CTAS 3 + layout 1 + config 재시작 조건 1, 수정 1: TestRestCatalogHttpErrors. 0 failures)
+[x] 관련 regression 통과        (icebergcatalog 386, plugins/s3 112, dac/backend 78, UI spec 103 passing / 9 pending, generic REST fixture E2E. sabot/kernel은 변경이 없어 실행하지 않음(N/A))
+[x] AbleOps Local CI             (`localci run --profile full --no-cache`: 6개 step 모두 SUCCESS (2차, review 수정 뒤 3차). 원격 submit은 Lead)
+[x] secret/log 검토             (7개 instance scan-secrets 0건, UI 응답/page 0건, `git diff`와 신규 파일에 MinIO secret 0건)
+[x] git diff/status 검토        (Integration Agent)
+[x] 문서 갱신                   (test-results.md §5–§6, known-limitations.md, progress.md, compatibility-matrix.md, configuration.md, design.md, security.md, storage.md §16, harness README)
+[ ] commit 완료                 (Lead)
+[ ] origin push 완료            (Lead)
+[ ] commit SHA 기록             (Phase 현황 표, TBD)
+```
+
+### AbleOps Local CI
+
+`localci run --profile full --no-cache` (local mode). 아래는 review 수정 뒤 3차 실행(log `target/dev/localci-phase5-rf.log`, wall 2분 16초)이다. 2차 실행(`target/dev/localci-phase5.log`, 385 tests)도 모두 SUCCESS였다. 원격 `localci submit` 결과와 SHA는 Lead가 기록한다.
+
+| 구분 | Step | 결과 |
+|---|---|---|
+| 컴파일 + 테스트 | `icebergcatalog-test` | SUCCESS (386 tests, 0 failures, 0 skipped) |
+| 컴파일 + 테스트 | `s3-test` | SUCCESS (112 tests, 0 failures, 0 skipped) |
+| lint | `icebergcatalog-lint` (icebergcatalog + s3) | SUCCESS |
+| 후속: 정적 분석 | `icebergcatalog-static` (errorprone, forbiddenapis, enforcer) | SUCCESS |
+| 후속: UI | `ui-source-specs` | SUCCESS (103 passing, 9 pending, eslint 0 errors) |
+| 후속: harness | `e2e-harness-lint` | SUCCESS |
+| 원격 | `localci submit --profile full --no-cache` | Lead 실행 예정 |
+
+- 1차 실행(`target/dev/localci-phase5-run1.log`)은 `icebergcatalog-test`가 Phase 3 test `TestRestCatalogHttpErrors.testUntrustedSelfSignedCertificate`("handshake was attempted") 1건으로 FAILED였다. 같은 test는 그 전 module 단독 실행(Integration 2회, C와 F의 실행)에서는 PASS였다. 다른 step과 동시에 돌 때 client의 인증서 거부가 fake server에 alert(`SSLException`)가 아니라 reset/EOF로 보이는 경우 count가 0이 된다. Fake server가 `startHandshake()`를 명시적으로 하고 모든 `IOException`을 세도록 test code만 고쳤다.
+
+### E2E 요약 (영역별)
+
+| 영역 | Agent / INSTANCE | PASS | FAIL | ENVIRONMENT_BLOCKED | NOT_SUPPORTED |
+|---|---|---|---|---|---|
+| Source lifecycle | A / 1 | 19 | 3 (kernel K-01) | 0 | 1 (rename. `/catalog/{id}/refresh` A-12는 미실행 이월이라 제외) |
+| Read | B / 2 | 24 | 0 | 0 | 0 |
+| Write | C / 3 | 23 | 1 (`DROP TABLE IF EXISTS` 메시지, minor) | 0 | 2 (ADD PRIMARY KEY, REMOVE ORPHAN FILES) |
+| Namespace / View | C / 3 | 14 | 0 | 0 | 2 (`DROP FOLDER IF EXISTS`, `ALTER VIEW`) |
+| Cache / Metadata | E / 4 | 23 | 0 | 0 | 0 |
+| 장애 | F / 5 | 11 | 4 (known K-15 F-5, known C-08 F-12–F-14. 복구는 정상) | 0 | 0 |
+| Regression | F / 5 + Integration | 5 (`sabot/kernel`은 미실행 N/A, 제외) | 0 | 0 | 0 |
+| UI | G / 6 | 13 | 0 | 0 | 0 |
+| Integration 재검증 | Integration / 7 | 7 | 0 | 0 | 0 |
+| 합계 | | 139 | 8 | 0 | 5 |
+
+AWS S3와 multi-node는 Phase 4부터 ENVIRONMENT_BLOCKED이며 Phase 5에서 다시 실행하지 않았다.
+
+### Phase 5 code 변경
+
+| 파일 | 변경 | 검증 |
+|---|---|---|
+| `plugins/icebergcatalog/.../AbstractRestCatalogAccessor.java` | Partitioned CTAS가 Polaris에서 unpartitioned default spec으로 남던 문제 수정 (C). `stagedCreateOperations`로 commit할 metadata의 spec/sort order/location/property로 다시 stage하고, `ForbiddenMappingTableOperations.commit`은 `base == null` + partitioned spec일 때만 그 operations로 commit한다. 403은 `CommitForbiddenException` | unit 3, live C(INSTANCE=3), Integration I-2–I-7 |
+| `plugins/icebergcatalog/src/main/resources/restcatalog-layout.json` | MinIO help text: `dremio.s3.region=<region>` 대신 `fs.s3a.endpoint.region=<region>`(us-east-1이 아닐 때), 불필요한 requester-pays/bucket discovery key 제거 (Docs 초안 지적, storage.md와 일치) | unit 1 (`TestRestCatalogLayout`), live I-1 |
+| `plugins/icebergcatalog/src/test/.../TestRestCatalogNamespaceTableOps.java` | CTAS test 3건 | 39 tests |
+| `plugins/icebergcatalog/src/test/.../TestRestCatalogLayout.java` | help text test 1건 | 12 tests |
+| `plugins/icebergcatalog/src/test/.../TestRestIcebergCatalogPluginConfig.java` | cache field만 바꾼 config의 `equals`/`equalsIgnoringNotMetadataImpacting` test 1건 (review: N-14 재시작 조건 정정의 근거) | 29 tests |
+| `plugins/icebergcatalog/src/test/.../TestRestCatalogHttpErrors.java` | fake TLS server의 handshake 실패 count (flaky 수정) | 30 tests, Local CI |
+| `scripts/polaris-e2e/sql.sh` | COMPLETED 뒤 항상 `/results` 조회 (`SHOW`/`DESCRIBE`의 `rowCount=0` 문제, N-06) (B) | shellcheck, Local CI `e2e-harness-lint` |
+| `scripts/polaris-e2e/README.md` | G-09 이후 hint가 API 400 응답에 나온다는 점, `sql.sh` 동작 정정 | — |
+
+### Phase 6으로 넘기는 항목
+
+- **Kernel K-01**: source update 실패 시 `SourceMetadataManager`가 닫혀 background refresh가 재시작 전까지 멈춘다 (A-18–A-20 FAIL). 수정안: update 경로(`replacePlugin`/`replacePluginDeprecated`)는 `newStartSupplier(config, false)`로 metadata manager를 닫지 않는다. 공통 kernel 변경이라 Phase 5에서는 고치지 않았다.
+- **Plugin C-08**: table lookup/load 경로의 429/5xx/timeout/connection reset을 `RestCatalogExceptionMapper`로 hint와 redaction이 붙은 오류로 매핑 (F-12–F-14 FAIL, known).
+- **Plugin C-17**: `DROP TABLE IF EXISTS`(없는 table) 메시지. 외부에서 지워진 table의 목록 정리 동작과 함께 확인한 뒤 수정.
+- **Release packaging U-02**: release tarball은 `dac/ui`를 포함해 Maven으로 build해야 한다 (Phase 5 배포본은 scratchpad에서 jar만 교체).
+- 문서/운영: storage down hang 완화 설정(K-15, F-5 FAIL known. 기본 S3A 재시도 값 조정 여부도 검토), 외부 변경 stale 창(N-12, N-13), option 적용 시점(N-14: connection config가 바뀌는 update는 `@NotMetadataImpacting` field만 바꿔도 plugin 재시작, `metadataPolicy`만 바꾼 update는 재시작 없음), secret rotate가 실행 중 source를 끊지 않음(X-09), bad source 복구 경로(K-13).
+- 미실행: `ROLLBACK TABLE`, namespace location 밖 `LOCATION`(Phase 3/4 결과 유지), Spark 등 외부 engine이 data를 쓴 table, `mutable.enabled=false`(G-23), static bearer `token`, namespace property update, AWS S3/multi-node(ENVIRONMENT_BLOCKED).
+- 공통 code의 사소한 표기: rename 404(K-10), metadataPolicy 404(K-11), 재시작 시 일반 상태 메시지(K-12), class 이름 prefix(C-18).
+
+### Phase 5 — AbleOps Local CI 원격 검증
+
+`localci submit --profile full --no-cache` (run `ad6dd949`, 원격 Agent의 새 작업 공간, 144 s):
+
+| 구분 | Step | 결과 |
+|---|---|---|
+| 컴파일 + 테스트 | `icebergcatalog-test` | SUCCESS (386 tests, 0 failures, 0 skipped) |
+| 컴파일 + 테스트 | `s3-test` | SUCCESS (112 tests, 0 failures, 0 skipped) |
+| lint | `icebergcatalog-lint` | SUCCESS |
+| 후속: 정적 분석 | `icebergcatalog-static` | SUCCESS |
+| 후속: UI | `ui-source-specs` | SUCCESS |
+| 후속: harness | `e2e-harness-lint` | SUCCESS |
+
 ## 완료 기준 현황
 
 `[ ]`는 아직 충족하지 않았다는 뜻이다. 현재 상태와 근거를 함께 적는다.
@@ -342,31 +431,31 @@ Phase 4 diff review finding 13건을 하나씩 code로 확인한 뒤 반영했�
 | # | 기준 | 현재 상태 | 근거 / 다음 단계 |
 |---|---|---|---|
 | 1 | `[x]` Dremio OSS에서 RESTCATALOG Source 노출 | PASS | Phase 2 live gate #1, #2 (`GET /api/v3/source/type` 200) |
-| 2 | `[ ]` UI Source 생성 성공 | IN_PROGRESS | layout과 preset 구현, UI spec PASS, bundle 서빙 확인. 브라우저 수동 생성은 미실행 (Phase 3) |
-| 3 | `[x]` REST API Source 생성 성공 | PASS | Phase 2 live gate #3 (`POST /api/v3/catalog` 200, state `good`) |
+| 2 | `[x]` UI Source 생성 성공 | PASS | Phase 5 G(INSTANCE=6, Playwright) U-1–U-13: Polaris preset과 generic tile로 생성, `good`, namespace/table 탐색, 필수값·secret key validation, Edit masking, secret 0건. 단 release tarball은 `dac/ui` 포함 build 필요 (U-02) |
+| 3 | `[x]` REST API Source 생성 성공 | PASS | Phase 2 live gate #3. Phase 5 A-1/A-13/A-15/A-16: 생성, 삭제 후 재생성, 중복 이름 409, 잘못된 credential 400 + hint |
 | 4 | `[x]` Polaris OAuth2 인증 성공 | PASS | Phase 2 live. Phase 3: 잘못된 credential/scope/warehouse/endpoint hint가 API 응답에 나오고, token 만료(60초)·갱신, 401/403, Polaris 재시작 복구 확인 ([phase3-oauth-catalog.md](phase3-oauth-catalog.md)) |
 | 5 | `[x]` Namespace 탐색 성공 | PASS | Phase 2 live gate #7. Phase 3: nested(3 level) 양방향, CREATE/DROP FOLDER, 비어 있지 않은 namespace 메시지 |
-| 6 | `[x]` Table 탐색 성공 | PASS | Phase 3: Polaris API로 만든 table과 Dremio에서 만든 table/view가 catalog tree와 `INFORMATION_SCHEMA."TABLES"`에 보인다. Spark에서 만든 table은 Phase 5 |
-| 7 | `[ ]` SELECT 성공 | TBD (Phase 5) | Phase 2 smoke, Phase 3 live PASS (Polaris/Dremio table, view, read-only principal). 정식 검증은 Phase 5 |
-| 8 | `[ ]` CREATE TABLE 또는 CTAS 성공 | TBD (Phase 5) | Phase 3 live: CREATE TABLE, CTAS(3 level namespace 포함) PASS. partitioned CTAS와 정식 검증은 Phase 5 |
-| 9 | `[ ]` INSERT 성공 | TBD (Phase 5) | Phase 2 smoke, Phase 3 live PASS (INSERT/UPDATE/DELETE/MERGE) |
+| 6 | `[x]` Table 탐색 성공 | PASS | Phase 3. Phase 5 B-1–B-6, B-12: `SHOW SCHEMAS`/`SHOW TABLES`(harness 수정 후)/`INFORMATION_SCHEMA`, nested, 늦게 만든 table. Spark가 data를 쓴 table은 미실행 (Polaris API로 만든 table로 대신) |
+| 7 | `[x]` SELECT 성공 | PASS | Phase 5 B-7–B-22: type, complex type, filter, aggregate(Python 계산값 일치), join, EXPLAIN/pruning, `AT SNAPSHOT`/`AT TIMESTAMP`, metadata table |
+| 8 | `[x]` CREATE TABLE 또는 CTAS 성공 | PASS | Phase 5 C-1–C-8, C-26, I-2–I-6. Partitioned CTAS는 수정 전 FAIL(Polaris default spec unpartitioned) → plugin 수정 후 PASS |
+| 9 | `[x]` INSERT 성공 | PASS | Phase 5 C-9, C-14, C-24, C-25: INSERT VALUES/SELECT(partitioned 포함), UPDATE/DELETE/MERGE, 동시 INSERT(409 자동 재시도)·동시 UPDATE(`CONCURRENT_MODIFICATION`) |
 | 10 | `[x]` Polaris + S3/MinIO 접근 성공 | PASS (MinIO) / ENVIRONMENT_BLOCKED (AWS S3) | Phase 4: 공식 static baseline + MinIO endpoint로 전체 read/write cycle (A, Integration `base`), MinIO matrix (B), vended credential (C), secret 0건 (D). [storage.md](storage.md) |
-| 11 | `[ ]` Source restart/reload 성공 | TBD (Phase 5) | Phase 2 smoke: Dremio 재시작 후 `good`. Phase 3: Polaris 중지/재시작 후 자동 복구. source update 실패 후 background refresh 정지(kernel) 발견 |
-| 12 | `[x]` allowedNamespaces 동작 | PASS | Phase 3: recursive/non-recursive/nested/case/separator matrix (C). nested entry의 부모 folder 삭제 bug 수정 후 7분간 names refresh 반복에서 안정 (Integration). discovery 범위만 정하고 접근 제어는 아니다 |
-| 13 | `[x]` secret masking 정상 | PASS | Phase 2 live gate #4, #5, #13. Phase 3: state/오류 메시지 redaction(unit echo test), DEBUG 포함 live scan 0건. Phase 4: vended credential 포함 REST/job/profile/system table/log 노출 matrix 0건, HttpClient 4 header logger·Netty `LoggingHandler` 고정, key 없는 source fail closed ([security.md](security.md) §7). at-rest 암호화는 NOT_SUPPORTED (G-12, `dremio-admin encrypt` 완화책) |
-| 14 | `[ ]` Generic RESTCATALOG 회귀 없음 | IN_PROGRESS | icebergcatalog module 381 tests, plugins/s3 112 tests PASS (Phase 4 review 반영 후). Vended 경로는 flag가 false면 동작하지 않는다 (unit). icebergcatalog module 319 tests PASS (Phase 3, Review 반영 후). 오류 매핑은 Iceberg 예외 type 기반의 generic 구현. Polaris 외 REST catalog E2E는 Phase 5 |
-| 15 | `[ ]` 관련 unit/integration/E2E 검증 | IN_PROGRESS | Phase 3 신규/변경 test class 8개(251 tests), Phase 4 신규 test class 4개(62 tests) + `TestS3FileSystem` 2, E2E harness `scripts/polaris-e2e`. opt-in IT는 Phase 5 |
-| 16 | `[ ]` 문서 완료 | IN_PROGRESS | Phase 1–4 문서 (Phase 3: phase3-oauth-catalog.md, security.md. Phase 4: storage.md, security.md §7). Phase 6 문서 세트 남음 |
-| 17 | `[ ]` 모든 Phase commit/push 완료 | IN_PROGRESS | Phase 1 `67cf10e4c`, Phase 2 `f2553db4a` (+ `ffd1cc1b2`), Phase 3 `3b85d3619`. Phase 4 commit 대기 |
+| 11 | `[x]` Source restart/reload 성공 | PASS (K-01 제약) | Phase 5 A-6(재시작 후 config/secret 유지, `good`, SELECT/INSERT), A-7–A-10(REFRESH STATUS, REFRESH METADATA, 외부 schema 변경, names refresh), E-23, F-4(Polaris down 중 재시작 후 복구). 단 update 실패 뒤 background refresh 정지는 kernel K-01 FAIL (A-18–A-20), 재시작으로 복구 (A-21) |
+| 12 | `[x]` allowedNamespaces 동작 | PASS | Phase 3 matrix와 안정성 확인. Phase 5 A-4: update로 설정/제거, tree와 `INFORMATION_SCHEMA`에 목록 namespace만. discovery 범위만 정하고 접근 제어는 아니다 (목록 밖 table 직접 SELECT 성공 N-01, 목록 밖 view는 안 풀림 N-11) |
+| 13 | `[x]` secret masking 정상 | PASS | Phase 2 live gate #4, #5, #13. Phase 3: state/오류 메시지 redaction(unit echo test), DEBUG 포함 live scan 0건. Phase 4: vended credential 포함 REST/job/profile/system table/log 노출 matrix 0건, HttpClient 4 header logger·Netty `LoggingHandler` 고정, key 없는 source fail closed ([security.md](security.md) §7). at-rest 암호화는 NOT_SUPPORTED (G-12, `dremio-admin encrypt` 완화책). Phase 5: GET 4개 endpoint masking(A-2), 재시작 후 유지(A-6), UI Edit masking과 HTTP 응답 150개 0건(U-7, U-13), 7개 instance log scan 0건 |
+| 14 | `[x]` Generic RESTCATALOG 회귀 없음 | PASS | Phase 5: `apache/iceberg-rest-fixture`(OAuth/warehouse/scope 없음) E2E에서 CREATE FOLDER/TABLE, INSERT, SELECT, CTAS, UPDATE, DROP PASS. UI generic tile 생성(U-9–U-12). icebergcatalog 386, plugins/s3 112, dac/backend 78, UI spec 103 passing |
+| 15 | `[x]` 관련 unit/integration/E2E 검증 | PASS | Phase 3 251 tests, Phase 4 62 + 2, Phase 5 신규 5 + flaky 수정 1. E2E harness로 7개 instance live (test-results.md §5). 별도 opt-in IT는 만들지 않았다 (harness E2E로 대신) |
+| 16 | `[ ]` 문서 완료 | IN_PROGRESS | Phase 1–4 문서, Phase 6 문서 세트 초안(design.md, configuration.md, test-results.md, known-limitations.md)과 Phase 5 결과 반영. Phase 6 최종 검토 남음 |
+| 17 | `[ ]` 모든 Phase commit/push 완료 | IN_PROGRESS | Phase 1 `67cf10e4c`, Phase 2 `f2553db4a` (+ `ffd1cc1b2`), Phase 3 `3b85d3619`, Phase 4 `691f2b5a9` (push 완료). Phase 5 commit 대기 (Lead) |
 
 ## Gap 요약 (상세: [phase1-analysis.md §4](phase1-analysis.md#4-gap-목록))
 
 | 심각도 | Gap |
 |---|---|
 | blocker | ~~G-01 `@SourceType` 누락~~, ~~G-02 layout 누락~~ (Phase 2 해결) |
-| high | ~~G-03~~ (해결), ~~G-04~~ (Phase 4 vended runtime), G-05 Polaris `warehouse`/`scope` 필수 (UI/문서/hint 반영, 요구사항 자체는 Polaris), ~~G-06~~ (Phase 3 오류 매핑), ~~G-07~~ (해결), ~~G-08~~ (Phase 4: scheme 수정, MinIO 실측), G-28 data path (Phase 4 live PASS, Phase 5 정식 E2E) |
+| high | ~~G-03~~ (해결), ~~G-04~~ (Phase 4 vended runtime), G-05 Polaris `warehouse`/`scope` 필수 (UI/문서/hint 반영, 요구사항 자체는 Polaris), ~~G-06~~ (Phase 3 오류 매핑), ~~G-07~~ (해결), ~~G-08~~ (Phase 4: scheme 수정, MinIO 실측), ~~G-28~~ data path (Phase 4 live, Phase 5 정식 E2E PASS) |
 | medium | ~~G-09~~, ~~G-10~~, ~~G-11~~ (Phase 3 해결), G-12 secret at-rest (Hadoop conf 복사는 해결, `dremio-admin encrypt` 완화책), ~~G-13~~, ~~G-15~~, ~~G-16~~ (해결), G-22 LOCATION 403 (매핑은 Phase 3 unit, live는 Phase 5) |
-| low | G-14 (backend 해결, UI rename 미완), ~~G-17~~, ~~G-18~~, ~~G-19~~ (해결), G-20, G-21, G-23~G-27 |
+| low | G-14 (backend 해결, UI rename 미완), ~~G-17~~, ~~G-18~~, ~~G-19~~ (해결), G-20, G-21, G-23, G-24, G-25 (Phase 5 live 확인, 제약), G-26 (partitioned CTAS는 Phase 5 plugin 수정), G-27 |
 
 ## 환경 메모
 

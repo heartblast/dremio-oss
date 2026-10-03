@@ -63,8 +63,11 @@ if [ "$state" != COMPLETED ]; then
   jq -r '"error: " + (.errorMessage // "-") + (if (.cancellationReason // "") != "" then "\ncancel: " + .cancellationReason else "" end)' "$OUT" | redact
   exit 1
 fi
-if [ "$rows" -gt 0 ]; then
-  code="$(http GET "$DREMIO_URL/api/v3/job/$JOB/results?offset=0&limit=${SQL_LIMIT:-20}" "$OUT" "$HDR")"
-  [ "$code" = 200 ] || { echo "results: HTTP $code"; exit 1; }
-  jq -c '.rows[]' "$OUT" | redact
-fi
+# Always fetch the results: statements answered on the coordinator without executor fragments
+# (SHOW SCHEMAS / SHOW TABLES / DESCRIBE ...) report rowCount=0 in the job status even though the
+# results endpoint returns their rows.
+code="$(http GET "$DREMIO_URL/api/v3/job/$JOB/results?offset=0&limit=${SQL_LIMIT:-20}" "$OUT" "$HDR")"
+[ "$code" = 200 ] || { echo "results: HTTP $code"; exit 1; }
+fetched="$(jq -r '.rows | length' "$OUT")"
+if [ "$fetched" -gt 0 ] && [ "$rows" = 0 ]; then echo "(job rowCount=0; results endpoint returned $fetched rows)"; fi
+jq -c '.rows[]' "$OUT" | redact

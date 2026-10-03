@@ -380,6 +380,8 @@ Baseline lifecycle (source `polaris`, namespace `p4base`): source `good`, CREATE
 
 ## 16. 남은 항목 (Phase 5/6)
 
+Phase 5 결과(같은 MinIO recipe로 lifecycle/read/write/cache/장애 E2E, storage down과 잘못된 S3 secret 포함)는 [test-results.md §5](test-results.md#5-phase-5--실제-e2e--regression)에 있다. 아래 항목 중 multi-node와 P-A3은 Phase 5에서도 실행/구현하지 않았다. Storage down 시 기본 S3A 재시도로 SELECT가 오래 붙잡히는 문제(known-limitations K-15)가 Phase 5에서 추가로 확인되었다.
+
 - AWS S3 실측 전부 (static baseline, requester-pays, `ListAllMyBuckets` 없는 IAM user, instance profile, assumed role, AWS STS vending): ENVIRONMENT_BLOCKED. AWS 계정이 생기면 §14.1 E1, §14.2 (e)/(f), §12.3을 다시 실행한다.
 - Multi-node executor에서의 static/vended 경로 (Phase 5).
 - B 제안 P3 (compat mode에서 AWS 외 region 이름 허용), P4 (amazonaws.com이 아닌 endpoint에 compat이 꺼져 있으면 WARN: 지금은 MinIO access key ID가 AWS STS로 간다), P5 나머지 (harness truststore mount option): 미적용.
