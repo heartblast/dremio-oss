@@ -388,3 +388,4 @@ Phase 5 결과(같은 MinIO recipe로 lifecycle/read/write/cache/장애 E2E, sto
 - A 제안 P-A3: commit 시 403 외 `RESTException`(예: Polaris storage credential 오류)을 redact된 server message가 있는 `UserException`으로 매핑 (Phase 5).
 - Known limitations (Phase 6 `known-limitations.md`): source state check가 storage를 검사하지 않음 (A C1, B), Dremio 쪽 S3 오류로 실패한 CREATE TABLE이 Polaris에 남음 (A C6), vended credential limitation (§12.4), 잘못된 region INSERT의 "Memory was leaked" 표시, `DROP TABLE`이 S3 object를 남김.
 - Polaris FILE storage를 Dremio에서 읽는 경로, Azure/GCS: 미검증 (범위 밖).
+- Phase 6: 위 목록은 그대로 남는다 (AWS/multi-node는 ENVIRONMENT_BLOCKED, P-A3은 C-06 known). Phase 6 release tarball 최종 smoke(INSTANCE=3, 같은 MinIO recipe)는 PASS ([test-results.md §7](test-results.md#7-phase-6--최종-통합--release-readiness)).

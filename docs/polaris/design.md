@@ -1,7 +1,7 @@
 # Polaris RESTCATALOG 설계
 
 - 작업 정의: [polaris-catalog-support.md](../reference_docs/catalog-support/polaris-catalog-support.md)
-- 기준: `feature/polaris-restcatalog` (base `799ccbda4 Release 26.0.5`), Phase 1–4 commit (`67cf10e4c`, `f2553db4a`, `ffd1cc1b2`, `3b85d3619`, `691f2b5a9`). Apache Polaris `1.1.0-incubating`, Iceberg `1.7.0-5f7c992-20250730084652-3bf8b99` (Dremio fork).
+- 기준: `feature/polaris-restcatalog` (base `799ccbda4 Release 26.0.5`), Phase 1–5 commit (`67cf10e4c`, `f2553db4a`, `ffd1cc1b2`, `3b85d3619`, `691f2b5a9`, `6d2f6f4e9`) + Phase 6 작업 트리. Apache Polaris `1.1.0-incubating`, Iceberg `1.7.0-5f7c992-20250730084652-3bf8b99` (Dremio fork).
 - 관련 문서: [configuration.md](configuration.md) (등록 방법), [storage.md](storage.md) (Object Storage), [security.md](security.md) (secret/log), [known-limitations.md](known-limitations.md), [test-results.md](test-results.md), [compatibility-matrix.md](compatibility-matrix.md), [progress.md](progress.md).
 - 모든 secret은 placeholder다: `<client_id>:<client_secret>`, `<access-key>`, `<secret-key>`.
 
@@ -34,7 +34,7 @@ flowchart TB
     PLUGIN["RestIcebergCatalogPlugin<br/>(state/hint, redaction, fs conf, vended FS cache)"]
     ACC["IcebergRestCatalogAccessor<br/>(AbstractRestCatalogAccessor)"]
     CACHE["ExpiringCatalogCache<br/>(cached RESTCatalog client)"]
-    MAP["RestCatalogExceptionMapper<br/>(401/403/not-empty → UserException)"]
+    MAP["RestCatalogExceptionMapper<br/>(401/403/400/5xx/timeout/not-empty → UserException)"]
     FSC["DatasetFileSystemCache<br/>(per-source or per-dataset FS)"]
     VC["VendedCredentialsCache<br/>+ VendedStorageCredentials"]
     FIO["DremioFileIO<br/>(DremioRESTTableOperations)"]
@@ -89,9 +89,9 @@ flowchart TB
 | `IcebergCatalogPluginConfig` | `store/IcebergCatalogPluginConfig.java` | 공통 필드 tag 1–5 (property list, async, cache) | 기존 |
 | `RestIcebergCatalogPlugin` | `store/RestIcebergCatalogPlugin.java` | property 병합, REST client 전용 key 분리, sensitive key 판정(`isSensitivePropertyKey`), redaction(`redactSecrets`), state와 오류 hint(`getState`, `describeConnectionFailure`, `RECENT_FAILURES`), provider 교체, folder CRUD, vended FS cache | 2–4 |
 | `IcebergRestCatalogAccessor` | `store/IcebergRestCatalogAccessor.java` | cached `RESTCatalog`, state check(`checkStateInternal`), 401 시 client 교체, `NamespaceListingForbiddenException` | 3 |
-| `AbstractRestCatalogAccessor` | `store/AbstractRestCatalogAccessor.java` | namespace/table/view 동작, allowedNamespaces discovery와 folder listing, 403/401 매핑, `ForbiddenMappingTableOperations`/`CommitForbiddenException`, partitioned CTAS 재 stage(`stagedCreateOperations`), `loadTableStorageProperties`, FileIO 교체 | 기존 + 3, 4, 5 |
+| `AbstractRestCatalogAccessor` | `store/AbstractRestCatalogAccessor.java` | namespace/table/view 동작, allowedNamespaces discovery와 folder listing, 403/401/그 밖 `RESTException` 매핑(Phase 6), `DROP TABLE` 404(Phase 6), `ForbiddenMappingTableOperations`/`CommitForbiddenException`/`CommitNotAuthorizedException`, partitioned CTAS 재 stage(`stagedCreateOperations`), `loadTableStorageProperties`, FileIO 교체 | 기존 + 3, 4, 5, 6 |
 | `ExpiringCatalogCache` | `store/ExpiringCatalogCache.java` | catalog client 수명, `getIfPresent`/`replace`/`close` (race 수정) | 3 |
-| `RestCatalogExceptionMapper` | `store/RestCatalogExceptionMapper.java` | Iceberg 예외 type + server message만으로 `UserException` 생성 (§5) | 3 |
+| `RestCatalogExceptionMapper` | `store/RestCatalogExceptionMapper.java` | Iceberg 예외 type + server message만으로 `UserException` 생성 (§5), log용 redaction(`redactedForLogging`, Phase 6) | 3, 6 |
 | `CatalogAccessor` | `store/CatalogAccessor.java` | `loadTableStorageProperties` default method | 4 |
 | `VendedCredentialsCache` | `store/VendedCredentialsCache.java` | node별 table credential cache, 갱신/실패/없음 수명, redact된 WARN | 4 |
 | `VendedStorageCredentials` | `store/VendedStorageCredentials.java` | vended `s3.*` → `fs.s3a.*`, provider, 만료, 값 없는 `toString()` | 4 |
@@ -99,8 +99,9 @@ flowchart TB
 | `DremioRESTTableOperations` | `plugins/icebergcatalog/src/main/java/org/apache/iceberg/rest/DremioRESTTableOperations.java` | REST table operations를 `DremioFileIO`로 감싼다 | 기존 |
 | `S3FileSystem` | `plugins/s3/src/main/java/com/dremio/plugins/s3/store/S3FileSystem.java` | `getEndpoint()`: scheme이 있으면 유지 (G-08) | 4 |
 | Layout | `plugins/icebergcatalog/src/main/resources/restcatalog-layout.json` | UI form (General / Advanced Options), MinIO help text(`fs.s3a.endpoint.region`) | 2, 4, 5 |
-| UI preset | `dac/ui/src/utils/sourceUtils.ts` (`SOURCE_PRESETS`, `addSourcePresetTiles`, `validateSourcePropertyLists`) | "Apache Polaris OSS" tile, propertyList secret 검사 | 2 |
+| UI preset | `dac/ui/src/utils/sourceUtils.ts` (`SOURCE_PRESETS`, `addSourcePresetTiles`, `validateSourcePropertyLists`) | "Apache Polaris OSS" tile, propertyList secret 검사 (규칙은 backend와 같고 `TestRestIcebergCatalogPluginConfig.testSensitiveKeyRuleIsInSyncWithUi`가 동기화를 검사, Phase 6) | 2, 6 |
 | Log 설정 | `distribution/resources/src/main/resources/conf/logback.xml` | HttpClient 4/5 wire·headers, SigV4 signer, Netty logger INFO 고정 | fix, 4 |
+| `ManagedStoragePlugin` | `sabot/kernel/src/main/java/com/dremio/exec/catalog/ManagedStoragePlugin.java` | Source update 실패 시 metadata manager 유지 (`startReplacementAsync`, D-17, K-01) | 6 (kernel) |
 | Options | `sabot/kernel/src/main/java/com/dremio/exec/store/IcebergCatalogPluginOptions.java`, `sabot/kernel/.../exec/catalog/CatalogOptions.java` | §4.2 | 기존 |
 
 ## 4. 설정
@@ -164,15 +165,19 @@ Tag 1–9는 `IcebergCatalogPluginConfig`, 10–19는 `RestIcebergCatalogPluginC
 
 | Iceberg 예외 / 상황 | Dremio 오류 |
 |---|---|
-| `ForbiddenException` (403) – load/create/drop table·view, folder, CTAS staging, dataset lookup | PERMISSION ERROR "… denied the request to <action> [<entity>] …" + privilege hint |
+| `ForbiddenException` (403) – load/create/drop table·view, view replace, folder create/drop, CTAS staging, dataset lookup, storage credential 조회 | PERMISSION ERROR "… denied the request to <action> [<entity>] …" + privilege hint |
 | 403 + purge 관련 message (DROP VIEW) | PERMISSION ERROR + `polaris.config.drop-with-purge.enabled` hint (G-06) |
-| commit 403 | `CommitForbiddenException`(`ForbiddenException` 하위, cause = permission error). Iceberg `CleanableFailure`라 거부된 commit의 manifest가 정리되고, 사용자에게는 PERMISSION ERROR |
-| `NotAuthorizedException` (401) | PERMISSION ERROR + credential hint (state check가 client를 교체) |
+| commit 403 / 401 | `CommitForbiddenException`(`ForbiddenException` 하위) / `CommitNotAuthorizedException`(Phase 6, `NotAuthorizedException` 하위), cause = permission error. 둘 다 Iceberg `CleanableFailure`라 거부된 commit의 manifest가 정리되고, 사용자에게는 PERMISSION ERROR |
+| `NotAuthorizedException` (401) – 위 403과 같은 동작 전체 (Phase 6에서 create/drop view, view replace, create table, CTAS staging, folder create/drop, commit, drop table까지 확장) | PERMISSION ERROR "… rejected the credentials of the request to <action> [<entity>] …" + credential hint (state check가 client를 교체) |
 | `NamespaceNotEmptyException` (409) / 400 "not empty" | accessor는 typed `NamespaceNotEmptyException`, plugin `deleteFolder`가 VALIDATION ERROR "Folder [..] cannot be deleted because it is not empty…" (G-10) |
 | 부모 namespace 없음 / 이미 존재 | VALIDATION ERROR |
 | `NoSuchNamespaceException` (drop) | "Folder does not exist." |
 | `CommitFailedException` (409) | 매핑하지 않음 (기존 concurrent modification 경로) |
-| 그 밖 (`ServiceFailureException`, 429 `RESTException`, timeout/connection reset, commit 시 `RESTException` 등) | 매핑하지 않음 → 원래 예외 (known limitation C-06, C-08. Phase 5 F-12–F-14). Source state 메시지(§5.1)에는 이 경우에도 hint가 있다 |
+| Phase 6 (C-08): dataset lookup, load table/view(cache 사용 여부 무관), storage credential 조회와 DDL 경로(create table, CTAS staging, drop table, create/drop view, view replace, folder create/drop)의 그 밖 `RESTException` | `RestCatalogExceptionMapper.requestFailed`: CONNECTION ERROR. connection refused/unknown host → "Unable to reach …" + endpoint hint, TLS → TLS hint, timeout → "did not respond in time … (Read timed out)" + `rest.client.*-timeout-ms` hint, connection reset 등 → 재시도 안내, 500 → "server error (HTTP 500)", 503 → "unavailable (HTTP 503)" + `rest.client.max-retries` 안내, 그 밖(429/502/504 등, Iceberg가 status를 버림) → "unexpected HTTP error" + 후보 status 안내 |
+| Phase 6: 같은 경로의 `BadRequestException` (400) / `UnprocessableEntityException` (422) | VALIDATION ERROR "… rejected the request to <action> [<entity>] as invalid (HTTP 400/422) …" (둘 다 `RESTException` 하위라 위 CONNECTION 분기와 구분). Folder drop의 400 "not empty"는 위 `NamespaceNotEmptyException` 행이 먼저 처리한다 |
+| Phase 6 review: drop table의 400 / 422 | UNSUPPORTED_OPERATION ERROR, 같은 메시지 (`RestCatalogExceptionMapper.dropFailed`). `DropTableHandler`는 `IF EXISTS`에서 VALIDATION ERROR를 "Table [..] not found." 성공으로 바꾸므로, catalog가 거부해 table이 남았는데 성공으로 보고되지 않게 한다 |
+| `DROP TABLE`의 404 (Phase 6, C-17) | accessor가 `catalog.dropTable`의 `false`(404)와 없는 namespace를 `NoSuchTableException`으로. plugin은 Dremio catalog에 그 table이 없으면 `CatalogEntityNotFoundException` ("Table [<path>] not found" → `DROP TABLE IF EXISTS`는 "not found", `DROP TABLE`은 VALIDATION ERROR), 있으면(외부에서 지워졌지만 목록에 남은 table) 성공으로 처리해 Dremio entry를 지운다 (D-16) |
+| 그 밖 (commit 시 403/401 외 `RESTException`, `updateFolder`) | 매핑하지 않음 → 원래 예외 (known limitation C-06. `updateFolder`는 Dremio SQL/UI에서 쓰는 경로가 없다, N-15). Source state 메시지(§5.1)에는 hint가 있다 |
 
 REST v3 `POST /api/v3/catalog` folder 생성의 403은 `CatalogEntityForbiddenException`으로 바꿔 HTTP 403을 돌려준다.
 
@@ -227,6 +232,8 @@ REST v3 `POST /api/v3/catalog` folder 생성의 403은 `CatalogEntityForbiddenEx
 | D-13 | Polaris Management API 미구현 | 범위 제외. catalog/principal/grant는 외부 사전 준비 |
 | D-14 | S3 endpoint scheme 처리는 `plugins/s3`에서 1줄 수정 | 공통 S3 plugin의 버그(`http://http://…`)이며 MinIO 전용 code를 만들지 않는다. 기존 `host:port` 설정의 결과는 같다 |
 | D-15 | Partitioned CTAS는 commit할 metadata의 spec/sort order/location/property로 staged create를 다시 만들어 commit한다 (`stagedCreateOperations`) | CTAS의 schema-only staged create 위에 새 table metadata를 commit하면 partition spec에 `SetDefaultPartitionSpec`이 없어 Polaris가 unpartitioned spec 0을 default로 둔다 (Phase 5 C-6). Iceberg REST의 표준 create 경로만 쓰므로 Polaris 전용 code가 아니다. Unpartitioned CTAS와 다른 commit은 기존 경로 그대로 |
+| D-16 | `DROP TABLE`의 404는 Dremio catalog에 entry가 있으면 성공, 없으면 not found (Phase 6) | 다른 source(filesystem)와 같은 `DROP TABLE IF EXISTS` 동작. 외부에서 지운 table이 names refresh 전까지 목록에 남는 경우(N-10)에도 `DROP TABLE`로 정리할 수 있어야 한다. 판단은 system user로 namespace `exists(key, DATASET)` 조회 |
+| D-17 | Source update 실패 시 metadata manager를 닫지 않음 (Phase 6, kernel K-01) | `ManagedStoragePlugin.replacePlugin`/`replacePluginDeprecated`는 새 plugin을 `startReplacementAsync(config, skipEqualityCheck)`로 시작한다. 시작 실패 시 metadata manager를 닫는 것은 생성 경로(`skipEqualityCheck=true`, 실패하면 버리는 source)뿐이다. update 실패는 기존 plugin으로 되돌리므로 background refresh가 계속 돌아야 한다. 공통 kernel 변경이지만 모든 source type에 같은 의미이고 최초 기동 경로(`newStartSupplier`, 재시도)는 그대로 |
 
 ## 10. 변경 이력
 
@@ -237,5 +244,5 @@ REST v3 `POST /api/v3/catalog` folder 생성의 403은 `CatalogEntityForbiddenEx
 | fix | `ffd1cc1b2` | Local CI archive 범위, atomic stream close, `conf/logback.xml`에 HttpClient 5 wire/headers INFO 고정 |
 | 3 | `3b85d3619` | OAuth2/연결 오류 hint의 API 노출(G-09), state check client 재사용(G-11), `RestCatalogExceptionMapper`(G-06, G-10, G-22 매핑), `ExpiringCatalogCache` race 수정, allowedNamespaces folder listing 수정, E2E harness `scripts/polaris-e2e`, [phase3-oauth-catalog.md](phase3-oauth-catalog.md), [security.md](security.md) |
 | 4 | `691f2b5a9` | Vended credential runtime(G-04), provider fail closed, `S3FileSystem` endpoint scheme(G-08), HttpClient 4/SigV4/Netty logger 고정, harness env 정리, Local CI `s3-test`, [storage.md](storage.md) |
-| 5 | TBD (Lead) | 실제 E2E / Regression ([test-results.md §5](test-results.md#5-phase-5--실제-e2e--regression)): partitioned CTAS 수정(D-15), layout MinIO help text, harness `sql.sh` 결과 조회 수정, flaky TLS test 수정. 7개 instance live PASS 139 / FAIL 8 (kernel K-01 3, known C-08 3, known K-15 1, minor 1) / NOT_SUPPORTED 5 |
-| 6 | TBD | 문서 세트(design, configuration, known-limitations, test-results), release readiness |
+| 5 | `6d2f6f4e9` | 실제 E2E / Regression ([test-results.md §5](test-results.md#5-phase-5--실제-e2e--regression)): partitioned CTAS 수정(D-15), layout MinIO help text, harness `sql.sh` 결과 조회 수정, flaky TLS test 수정. 7개 instance live PASS 139 / FAIL 8 (kernel K-01 3, known C-08 3, known K-15 1, minor 1) / NOT_SUPPORTED 5 |
+| 6 | (Lead 기록) | C-08 동작 중 오류 매핑(`requestFailed`, 400/422 validation. 최종 review에서 DDL 경로까지 확장, drop table 400/422는 `dropFailed` UNSUPPORTED_OPERATION), 401 매핑 확장과 commit 401(`CommitNotAuthorizedException`), C-17 `DROP TABLE` 404(D-16), kernel K-01(D-17), listing 오류 log redaction, sensitive key 규칙 UI/backend 동기화 test, 중복 정리. Release tarball(`dac/ui` 포함 Maven build), 최종 smoke, 문서 세트 완성 ([test-results.md §7](test-results.md#7-phase-6--최종-통합--release-readiness)) |

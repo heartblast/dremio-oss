@@ -92,6 +92,7 @@ import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.exceptions.NoSuchViewException;
 import org.apache.iceberg.exceptions.NotAuthorizedException;
+import org.apache.iceberg.exceptions.RESTException;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.rest.DremioRESTTableOperations;
 import org.apache.iceberg.types.Types;
@@ -242,6 +243,10 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
       return loadTableInternal(tableIdentifier, options);
     } catch (ForbiddenException e) {
       throw forbidden(e, "load table", bracket(tableIdentifier));
+    } catch (NotAuthorizedException e) {
+      throw notAuthorized(e, "load table", bracket(tableIdentifier));
+    } catch (RESTException e) {
+      throw requestFailed(e, "load table", bracket(tableIdentifier));
     }
   }
 
@@ -275,6 +280,10 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
       return loadViewInternal(tableIdentifier, options);
     } catch (ForbiddenException e) {
       throw forbidden(e, "load view", bracket(tableIdentifier));
+    } catch (NotAuthorizedException e) {
+      throw notAuthorized(e, "load view", bracket(tableIdentifier));
+    } catch (RESTException e) {
+      throw requestFailed(e, "load view", bracket(tableIdentifier));
     }
   }
 
@@ -337,6 +346,14 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
 
   private UserException notAuthorized(NotAuthorizedException e, String action, Object entity) {
     return RestCatalogExceptionMapper.notAuthorized(e, action, entity, redactor);
+  }
+
+  private Throwable redactedForLogging(Throwable e) {
+    return RestCatalogExceptionMapper.redactedForLogging(e, redactor);
+  }
+
+  private UserException requestFailed(RESTException e, String action, Object entity) {
+    return RestCatalogExceptionMapper.requestFailed(e, action, entity, redactor);
   }
 
   @Override
@@ -419,7 +436,13 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
           root,
           RestCatalogExceptionMapper.redactedServerMessage(ex, redactor));
     } catch (Exception ex) {
-      logger.error("Error listing namespace {}", root.toString(), ex);
+      // Logged on every metadata refresh: one line with the redacted server message, the stack
+      // trace at DEBUG only.
+      logger.warn(
+          "Error listing namespace {}: {}",
+          root,
+          RestCatalogExceptionMapper.redactedServerMessage(ex, redactor));
+      logger.debug("Error listing namespace {}", root, redactedForLogging(ex));
     }
     return Stream.empty();
   }
@@ -429,9 +452,7 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
     try {
       return catalogInstance.listTables(namespace).stream();
     } catch (Exception ex) {
-      if (logger.isDebugEnabled()) {
-        logger.debug("Error listing tables in namespace {}", namespace.toString(), ex);
-      }
+      logger.debug("Error listing tables in namespace {}", namespace, redactedForLogging(ex));
     }
     return Stream.empty();
   }
@@ -461,9 +482,7 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
     try {
       return ((ViewCatalog) catalogInstance).listViews(namespace).stream();
     } catch (Exception ex) {
-      if (logger.isDebugEnabled()) {
-        logger.debug("Error listing views in namespace {}", namespace.toString(), ex);
-      }
+      logger.debug("Error listing views in namespace {}", namespace, redactedForLogging(ex));
     }
     return Stream.empty();
   }
@@ -494,6 +513,8 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
       throw forbidden(e, "look up", bracket(tableIdentifier));
     } catch (NotAuthorizedException e) {
       throw notAuthorized(e, "look up", bracket(tableIdentifier));
+    } catch (RESTException e) {
+      throw requestFailed(e, "look up", bracket(tableIdentifier));
     }
 
     logger.warn("DatasetHandle '{}' not found - table or view not found.", dataset);
@@ -636,6 +657,8 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
       throw forbidden(e, "load the storage credentials of table", bracket(tableIdentifier));
     } catch (NotAuthorizedException e) {
       throw notAuthorized(e, "load the storage credentials of table", bracket(tableIdentifier));
+    } catch (RESTException e) {
+      throw requestFailed(e, "load the storage credentials of table", bracket(tableIdentifier));
     }
   }
 
@@ -759,7 +782,7 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
    * discovered anyway; so is an allowed namespace whose properties could not be loaded but whose
    * children were listed. The whole-catalog listing is already in that order and stays lazy.
    */
-  private static Stream<IcebergNamespaceWithProperties> streamNamespaceWithPropertiesWithRoot(
+  private Stream<IcebergNamespaceWithProperties> streamNamespaceWithPropertiesWithRoot(
       SupportsNamespaces catalog,
       Set<Namespace> allowedNamespaces,
       boolean isRecursiveAllowedNamespaces) {
@@ -796,7 +819,7 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
     return missing;
   }
 
-  private static Stream<IcebergNamespaceWithProperties> streamNamespaceWithProperties(
+  private Stream<IcebergNamespaceWithProperties> streamNamespaceWithProperties(
       SupportsNamespaces catalog,
       Set<Namespace> allowedNamespaces,
       boolean isRecursiveAllowedNamespaces) {
@@ -808,7 +831,7 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
         .flatMap(ns -> streamNamespaceWithPropertiesRecursive(catalog, ns));
   }
 
-  private static Stream<IcebergNamespaceWithProperties> streamNamespaceWithPropertiesRecursive(
+  private Stream<IcebergNamespaceWithProperties> streamNamespaceWithPropertiesRecursive(
       SupportsNamespaces catalog, Namespace namespace) throws NoSuchNamespaceException {
     List<Namespace> namespaces = getSubNamespaces(catalog, namespace);
     if (namespaces.isEmpty()) {
@@ -819,51 +842,53 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
         namespaces.stream().flatMap(ns -> streamNamespaceWithPropertiesRecursive(catalog, ns)));
   }
 
-  private static List<Namespace> getSubNamespaces(SupportsNamespaces catalog, Namespace namespace) {
+  private List<Namespace> getSubNamespaces(SupportsNamespaces catalog, Namespace namespace) {
     try {
       return catalog.listNamespaces(namespace);
     } catch (NoSuchNamespaceException e) {
-      // An allowed namespace that does not exist, or one deleted while refreshing metadata. Logged
-      // on every metadata refresh, so without a stack trace.
-      logger.warn(
-          "Namespace {} does not exist (it is configured as an allowed namespace but missing in"
-              + " the catalog, or it was deleted while refreshing metadata).",
-          namespace);
+      logMissingNamespace(namespace);
       return Collections.emptyList();
     } catch (Exception e) {
-      logger.debug(
-          "Error listing namespace {}. This could occur if we are not authorized to access it.",
-          namespace.toString(),
-          e);
+      logNamespaceListingError(namespace, e);
       return Collections.emptyList();
     }
   }
 
-  private static Stream<IcebergNamespaceWithProperties> getNamespacesWithProperties(
+  /**
+   * An allowed namespace that does not exist, or one deleted while refreshing metadata. Logged on
+   * every metadata refresh, so without a stack trace.
+   */
+  private static void logMissingNamespace(Namespace namespace) {
+    logger.warn(
+        "Namespace {} does not exist (it is configured as an allowed namespace but missing in"
+            + " the catalog, or it was deleted while refreshing metadata).",
+        namespace);
+  }
+
+  private void logNamespaceListingError(Namespace namespace, Exception e) {
+    logger.debug(
+        "Error listing namespace {}. This could occur if we are not authorized to access it.",
+        namespace,
+        redactedForLogging(e));
+  }
+
+  private Stream<IcebergNamespaceWithProperties> getNamespacesWithProperties(
       SupportsNamespaces catalog, Collection<Namespace> namespaces) {
     return namespaces.stream()
         .map(ns -> getNamespaceWithProperties(catalog, ns).orElse(null))
         .filter(Objects::nonNull);
   }
 
-  private static Optional<IcebergNamespaceWithProperties> getNamespaceWithProperties(
+  private Optional<IcebergNamespaceWithProperties> getNamespaceWithProperties(
       SupportsNamespaces catalog, Namespace namespace) throws NoSuchNamespaceException {
     try {
       return Optional.of(
           new IcebergNamespaceWithProperties(namespace, catalog.loadNamespaceMetadata(namespace)));
     } catch (NoSuchNamespaceException e) {
-      // An allowed namespace that does not exist, or one deleted while refreshing metadata. Logged
-      // on every metadata refresh, so without a stack trace.
-      logger.warn(
-          "Namespace {} does not exist (it is configured as an allowed namespace but missing in"
-              + " the catalog, or it was deleted while refreshing metadata).",
-          namespace);
+      logMissingNamespace(namespace);
       return Optional.empty();
     } catch (Exception e) {
-      logger.debug(
-          "Error listing namespace {}. This could occur if we are not authorized to access it.",
-          namespace.toString(),
-          e);
+      logNamespaceListingError(namespace, e);
       return Optional.empty();
     }
   }
@@ -890,6 +915,10 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
           .create();
     } catch (ForbiddenException e) {
       throw forbidden(e, "create table", bracket(tableIdentifier));
+    } catch (NotAuthorizedException e) {
+      throw notAuthorized(e, "create table", bracket(tableIdentifier));
+    } catch (RESTException e) {
+      throw requestFailed(e, "create table", bracket(tableIdentifier));
     } catch (NoSuchNamespaceException e) {
       throw RestCatalogExceptionMapper.parentNamespaceNotFound(e, tableIdentifier);
     } catch (AlreadyExistsException e) {
@@ -906,16 +935,21 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
       String sql)
       throws AlreadyExistsException, NoSuchNamespaceException {
     TableIdentifier viewIdentifier = tableIdentifierFromDataset(viewPathComponents);
-    if (((ViewCatalog) getCatalog()).viewExists(viewIdentifier)) {
-      throw new AlreadyExistsException("View [%s] already exists with the source.", viewIdentifier);
-    }
     Preconditions.checkArgument(!viewPathComponents.isEmpty(), "View path cannot be empty.");
     try {
+      if (((ViewCatalog) getCatalog()).viewExists(viewIdentifier)) {
+        throw new AlreadyExistsException(
+            "View [%s] already exists with the source.", viewIdentifier);
+      }
       return getViewBuilder(
               viewIdentifier, schema, location, workspaceSchemaPath, viewPathComponents.get(0), sql)
           .create();
     } catch (ForbiddenException e) {
       throw forbidden(e, "create view", bracket(viewIdentifier));
+    } catch (NotAuthorizedException e) {
+      throw notAuthorized(e, "create view", bracket(viewIdentifier));
+    } catch (RESTException e) {
+      throw requestFailed(e, "create view", bracket(viewIdentifier));
     }
   }
 
@@ -926,6 +960,10 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
       ((ViewCatalog) getCatalog()).dropView(viewIdentifier);
     } catch (ForbiddenException e) {
       throw forbidden(e, "drop view", bracket(viewIdentifier));
+    } catch (NotAuthorizedException e) {
+      throw notAuthorized(e, "drop view", bracket(viewIdentifier));
+    } catch (RESTException e) {
+      throw requestFailed(e, "drop view", bracket(viewIdentifier));
     }
   }
 
@@ -938,16 +976,20 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
       String sql)
       throws NoSuchViewException {
     TableIdentifier viewIdentifier = tableIdentifierFromDataset(viewPathComponents);
-    if (!((ViewCatalog) getCatalog()).viewExists(viewIdentifier)) {
-      throw new NoSuchViewException("Cannot find View [%s] in the source.", viewIdentifier);
-    }
     // TODO(DX-99998) Add retryer
     try {
+      if (!((ViewCatalog) getCatalog()).viewExists(viewIdentifier)) {
+        throw new NoSuchViewException("Cannot find View [%s] in the source.", viewIdentifier);
+      }
       return getViewBuilder(
               viewIdentifier, schema, location, workSchemaPath, viewPathComponents.get(0), sql)
           .replace();
     } catch (ForbiddenException e) {
       throw forbidden(e, "replace view", bracket(viewIdentifier));
+    } catch (NotAuthorizedException e) {
+      throw notAuthorized(e, "replace view", bracket(viewIdentifier));
+    } catch (RESTException e) {
+      throw requestFailed(e, "replace view", bracket(viewIdentifier));
     }
   }
 
@@ -1007,15 +1049,33 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
     return getDatasetLocationFromExistingNamespaceLocationUri(identifier, namespaceCatalog);
   }
 
+  /**
+   * Drops the table from the catalog without purging its data (what Spark does by default for
+   * external tables).
+   *
+   * @throws NoSuchTableException when the catalog has no such table (or no such namespace): the
+   *     Iceberg REST client reports an HTTP 404 for the table by returning false
+   */
   @Override
   public void dropTable(List<String> dataset) {
-    // This implementation does NOT purge the data.
-    // This is following what Spark does by default for "external tables".
     TableIdentifier tableIdentifier = tableIdentifierFromDataset(dataset);
+    boolean dropped;
     try {
-      getCatalog().dropTable(tableIdentifier, false);
+      dropped = getCatalog().dropTable(tableIdentifier, false);
+    } catch (NoSuchNamespaceException e) {
+      dropped = false;
     } catch (ForbiddenException e) {
       throw forbidden(e, "drop table", bracket(tableIdentifier));
+    } catch (NotAuthorizedException e) {
+      throw notAuthorized(e, "drop table", bracket(tableIdentifier));
+    } catch (RESTException e) {
+      // Not requestFailed: an HTTP 400/422 must not become a validation error, which DROP TABLE IF
+      // EXISTS would report as "not found" while the table still exists.
+      throw RestCatalogExceptionMapper.dropFailed(
+          e, "drop table", bracket(tableIdentifier), redactor);
+    }
+    if (!dropped) {
+      throw new NoSuchTableException("Table does not exist: %s", tableIdentifier);
     }
   }
 
@@ -1045,6 +1105,10 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
       stagedCreate = tableOperationsHelperForCtas(dataset, schema);
     } catch (ForbiddenException e) {
       throw forbidden(e, "create table", bracket(tableIdentifierFromDataset(dataset)));
+    } catch (NotAuthorizedException e) {
+      throw notAuthorized(e, "create table", bracket(tableIdentifierFromDataset(dataset)));
+    } catch (RESTException e) {
+      throw requestFailed(e, "create table", bracket(tableIdentifierFromDataset(dataset)));
     }
     final TableIdentifier tableIdentifier = tableIdentifierFromDataset(dataset);
     return new ForbiddenMappingTableOperations(
@@ -1134,6 +1198,10 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
       return supportsNamespaces.loadNamespaceMetadata(namespace);
     } catch (ForbiddenException e) {
       throw forbidden(e, "create folder", bracket(namespace));
+    } catch (NotAuthorizedException e) {
+      throw notAuthorized(e, "create folder", bracket(namespace));
+    } catch (RESTException e) {
+      throw requestFailed(e, "create folder", bracket(namespace));
     } catch (NoSuchNamespaceException e) {
       throw RestCatalogExceptionMapper.parentNamespaceNotFound(e, namespace);
     }
@@ -1171,9 +1239,13 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
       if (RestCatalogExceptionMapper.isNamespaceNotEmpty(e)) {
         throw new NamespaceNotEmptyException(e, "Namespace %s is not empty", namespace);
       }
-      throw e;
+      throw requestFailed(e, "drop folder", bracket(namespace));
     } catch (ForbiddenException e) {
       throw forbidden(e, "drop folder", bracket(namespace));
+    } catch (NotAuthorizedException e) {
+      throw notAuthorized(e, "drop folder", bracket(namespace));
+    } catch (RESTException e) {
+      throw requestFailed(e, "drop folder", bracket(namespace));
     }
     if (!dropped) {
       // RESTSessionCatalog#dropNamespace returns false only when the server answers 404.
@@ -1189,10 +1261,10 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
   }
 
   /**
-   * Table operations that report an HTTP 403 on commit as a permission error instead of a system
-   * error (see {@link CommitForbiddenException}). Other commit failures (e.g. {@code
-   * CommitFailedException} on HTTP 409) are left to the Iceberg commit path, which already reports
-   * them as concurrent modification errors.
+   * Table operations that report an HTTP 403 or 401 on commit as a permission error instead of a
+   * system error (see {@link CommitForbiddenException} and {@link CommitNotAuthorizedException}).
+   * Other commit failures (e.g. {@code CommitFailedException} on HTTP 409) are left to the Iceberg
+   * commit path, which already reports them as concurrent modification errors.
    */
   @VisibleForTesting
   static final class ForbiddenMappingTableOperations extends DremioRESTTableOperations {
@@ -1251,6 +1323,10 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
         throw new CommitForbiddenException(
             RestCatalogExceptionMapper.forbidden(
                 e, "commit to table", bracket(PathUtils.constructFullPath(dataset)), redactor));
+      } catch (NotAuthorizedException e) {
+        throw new CommitNotAuthorizedException(
+            RestCatalogExceptionMapper.notAuthorized(
+                e, "commit to table", bracket(PathUtils.constructFullPath(dataset)), redactor));
       }
     }
   }
@@ -1270,9 +1346,17 @@ public abstract class AbstractRestCatalogAccessor implements CatalogAccessor {
     CommitForbiddenException(UserException permissionError) {
       super(permissionError, "%s", permissionError.getOriginalMessage());
     }
+  }
 
-    UserException getPermissionError() {
-      return (UserException) getCause();
+  /**
+   * An HTTP 401 on commit (the catalog rejected the session token), carrying the permission error
+   * to report. A {@link NotAuthorizedException}, which is a {@code CleanableFailure}, for the same
+   * reason as {@link CommitForbiddenException}.
+   */
+  @VisibleForTesting
+  static final class CommitNotAuthorizedException extends NotAuthorizedException {
+    CommitNotAuthorizedException(UserException permissionError) {
+      super(permissionError, "%s", permissionError.getOriginalMessage());
     }
   }
 

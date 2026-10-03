@@ -2,7 +2,8 @@
 
 - 이 문서는 RESTCATALOG source가 다루는 secret이 어디로 흘러가고 어디에 남지 않아야 하는지 정리한다.
 - Phase 3에서 처음 작성했고 Phase 4(Object Storage, vended credentials)에서 storage credential 항목을 보강했다 (§1, §2, §3의 Phase 4 행과 §7). Storage 설정 자체는 [storage.md](storage.md).
-- 기준 코드: `feature/polaris-restcatalog` Phase 3 `3b85d3619` + Phase 4 작업 트리 (review 반영 포함). Iceberg `1.7.0-5f7c992-20250730084652-3bf8b99` (Dremio fork). `HTTPClient`는 Apache HttpClient `5.3.1`을 relocation 없이 쓴다.
+- Phase 6에서 동작 중 오류 매핑(C-08)과 log redaction을 넓혀 §2, §3, §6을 갱신했다.
+- 기준 코드: `feature/polaris-restcatalog` Phase 3 `3b85d3619` + Phase 4 `691f2b5a9` + Phase 5 `6d2f6f4e9` + Phase 6 작업 트리. Iceberg `1.7.0-5f7c992-20250730084652-3bf8b99` (Dremio fork). `HTTPClient`는 Apache HttpClient `5.3.1`을 relocation 없이 쓴다.
 - 관련 문서: [phase3-oauth-catalog.md](phase3-oauth-catalog.md) (Phase 3 시나리오 결과), [progress.md](progress.md), [compatibility-matrix.md](compatibility-matrix.md).
 - 이 문서의 모든 secret은 placeholder(`<client_id>:<client_secret>`, `<s3AccessKey>`, `<s3SecretKey>`)다. Polaris bootstrap root secret `s3cr3t`는 throwaway container용 로컬 테스트 값이다.
 
@@ -37,7 +38,8 @@
 | Vended credential 조회 실패 (Phase 4) | WARN 한 줄. catalog 메시지는 `redactSecrets` + `redactedServerMessage`로 줄인다 | C `VendedCredentialsCache.describe` |
 | Vended key 이름 (Phase 4) | `isSensitivePropertyKey`는 `s3.access-key-id`, `s3.secret-access-key`, `s3.session-token`, `fs.s3a.session.token`, `gcs.oauth2.token`, `adls.sas-token.*`, `credential`, `token`, `header.Authorization`을 secret으로 본다 (대소문자 무시). `s3.session-token-expires-at-ms`, `expiration-time`, `client.refresh-credentials-endpoint`, `client.region`, `s3.endpoint`, `s3.path-style-access`, `gcs.oauth2.token-expires-at`은 secret이 아니다 | D unit `testVendedCredentialKeysAreSensitive` |
 | S3 요청 (Phase 4) | SigV4는 secret key를 보내지 않는다. Session token은 `X-Amz-Security-Token` header로만 간다. S3 오류(`AccessDeniedException`/`AmazonS3Exception`, MinIO `Forbidden`/`SignatureDoesNotMatch`)에 key 값이 없다 | D unit (fake S3가 받은 raw request), live (잘못된 S3 secret source) |
-| 동작 중 오류 (`RestCatalogExceptionMapper`) | Review 반영: plugin이 `redactSecrets`를 accessor와 mapper에 넘긴다. 401/403 permission error의 server message는 redact → 300자 제한 → redact. cause로 남기는 Iceberg 예외도 message에 secret이 있으면 redact된 같은 type의 예외(원래 stack trace)로 바꾼다. job profile과 server.log에 찍히는 cause chain에도 secret이 남지 않는다 | unit `testTableExists403/401IsRaisedWithoutSecrets`(server가 secret echo), `testServerMessageIsRedactedInMessageAndCause` |
+| 동작 중 오류 (`RestCatalogExceptionMapper`) | Review 반영: plugin이 `redactSecrets`를 accessor와 mapper에 넘긴다. 401/403 permission error의 server message는 redact → 300자 제한 → redact. cause로 남기는 Iceberg 예외도 message에 secret이 있으면 redact된 같은 type의 예외(원래 stack trace)로 바꾼다. job profile과 server.log에 찍히는 cause chain에도 secret이 남지 않는다. Phase 6: table lookup/load 경로와 DDL 경로(create/drop table, CTAS staging, create/drop/replace view, create/drop folder)의 429/5xx/timeout/network/TLS(`requestFailed`, CONNECTION ERROR)와 400/422(VALIDATION ERROR, drop table은 UNSUPPORTED_OPERATION ERROR)도 같은 방식으로 redact한다 (C-08). HTML만 있는 message는 예외 type 이름으로 바꾼다 | unit `testTableExists403/401IsRaisedWithoutSecrets`(server가 secret echo), `testServerMessageIsRedactedInMessageAndCause`, Phase 6 `testRequestFailedRedactsServerTextAndCause`, `TestRestCatalogHttpErrors`(fake HTTP catalog의 500/429/503/502 HTML/timeout/연결 끊김) |
+| 오류 log의 stack trace (Phase 6) | namespace/table/view listing 실패는 WARN 한 줄(redact된 server message)이고 stack trace는 DEBUG에만 남긴다. DEBUG로 넘기는 예외는 cause chain의 어느 message에 secret 값이 있으면 redact된 message와 원래 stack trace만 가진 예외로 바꾼다 (`RestCatalogExceptionMapper.redactedForLogging`) | unit `testRedactedForLoggingDropsSecretsFromTheCauseChain` |
 
 ## 3. Log 설정
 
@@ -55,7 +57,7 @@
 - **관찰 (후속 확인 필요, Phase 4 D).** logback hot reload(`scan="true"`) 때 `server.out`에 `no applicable action for [turboFilter]`가 찍혔다. reload 후 `BlockLogLevelTurboFilter`가 빠진다면 root level만 올려도 third-party logger가 DEBUG가 될 수 있다. Logger 단위 고정은 **위에 나열한 logger만** 막는다 (HttpClient 4/5 wire·headers, SigV4 signer, Netty `LoggingHandler`/`Http2FrameLogger`). 다른 third-party logger가 request header를 찍는 경로가 새로 생기면 따로 고정해야 한다.
 - **`BlockLogLevelTurboFilter`.** 기본 설정은 `com.dremio` 외의 DEBUG를 막는다. D는 live 검증에서 `org.apache.iceberg,DEBUG`와 `org.apache.hc.client5,DEBUG`를 추가해 1,458줄의 DEBUG log를 만들었고, 이때도 secret 노출은 0건이었다 (wire/headers는 INFO 유지).
 - **`Property.toString()`.** `sabot/kernel`의 `com.dremio.exec.catalog.conf.Property`는 `toString()`에 value를 넣는다. `secretPropertyList`를 그대로 log에 넘기면 secret이 찍힌다. 현재 plugin code는 key 이름만 log에 남긴다. 새 log 문을 쓸 때 주의한다.
-- **namespace listing 실패 로그.** Phase 3 integration에서 `NoSuchNamespaceException`/`ForbiddenException`은 stack trace 없는 WARN 한 줄로 바꿨다 (`Skipping namespace … : <server message>`, `Namespace … does not exist …`). Review 반영으로 `Skipping namespace`의 server message도 redact하고 300자로 줄인다 (unit `testListNamespaces403IsReportedWithoutSecrets`가 secret을 echo하는 403으로 확인). 그 밖의 예외는 기존대로 ERROR와 stack trace를 남긴다.
+- **namespace listing 실패 로그.** Phase 3 integration에서 `NoSuchNamespaceException`/`ForbiddenException`은 stack trace 없는 WARN 한 줄로 바꿨다 (`Skipping namespace … : <server message>`, `Namespace … does not exist …`). Review 반영으로 `Skipping namespace`의 server message도 redact하고 300자로 줄인다 (unit `testListNamespaces403IsReportedWithoutSecrets`가 secret을 echo하는 403으로 확인). Phase 6부터 그 밖의 listing 예외도 ERROR + stack trace 대신 WARN 한 줄(`Error listing namespace …: <redact된 message>`)이고, stack trace는 DEBUG에서 redact된 예외로만 찍는다.
 - **E2E harness.** `common.sh`의 `redact()`는 `S3_SECRET_KEY`, `AWS_SECRET_ACCESS_KEY`, `MINIO_SECRET_KEY`, `POLARIS_ROOT_SECRET`, `E2E_SRC_CREDENTIAL`, `SOURCE_CREDENTIAL`, `E2E_PRINCIPAL_SECRET`, `E2E_EXTRA_SECRET`와 `$WORK/principal-*.cred`의 secret을 가린다. `id:secret` 값은 secret 부분도 따로 가린다. `scan-secrets.sh`는 rotate된 `log/archive/*.gz`도 풀어서 센다 (Review 반영).
 
 ## 4. Secret 노출 검증 결과
@@ -106,7 +108,7 @@ Dremio fork 1.7 `org.apache.iceberg.rest.HTTPClient`와 `ExponentialHttpRequestR
 | 항목 | 내용 | 다음 단계 |
 |---|---|---|
 | G-12 at-rest 평문 | `secretPropertyList`는 KV store에 평문이다 (`encryptSecrets`는 `SecretRef` 전용). `RESTCatalog.properties()`에도 남는다. Phase 4 live 재확인: client secret과 S3 secret key가 RocksDB(`data/db`)에 평문. 실패한 생성/update 요청의 값은 저장되지 않는다 | 완화책 `dremio-admin encrypt` (§7.3, live PASS). kernel 범위 open item. Phase 6 known-limitations |
-| 동작 중 오류의 redaction | 401/403 매핑과 namespace listing WARN은 redact한다 (Review 반영). 매핑하지 않는 오류(예: `tableExists` 500의 raw `ServiceFailureException`)와 DEBUG log의 stack trace는 server message를 그대로 담는다 | server가 secret을 echo하는 catalog가 있으면 매핑 범위를 넓힌다 |
+| 동작 중 오류의 redaction | Phase 6: table lookup/load, view load, storage credential 조회와 DDL 경로(create table, CTAS staging, drop table, create/drop view, view replace, folder create/drop)의 모든 `RESTException`(401/403/400/422/429/5xx/timeout/network)을 매핑하고 redact한다 (C-08. DDL 경로의 403/401 외 예외는 Phase 6 review에서 추가). Listing 오류 log와 DEBUG stack trace도 redact한다. 남은 경로: commit 시 403/401 외 `RESTException`(C-06), `updateFolder`(Dremio에서 쓰는 경로 없음), Iceberg library 내부 log | C-06은 Iceberg commit 경로의 5xx 처리(`CommitStateUnknownException`)를 바꾸지 않기 위해 그대로 둔다 |
 | 실행 중 받은 값 | OAuth2 access token, vended S3 credential은 config에 없으므로 `redactSecrets` 대상이 아니다 | Phase 4: vended credential은 log/profile/KV에 남지 않는다 (live 0건). memory에는 만료 직전까지 남는다 (node별 cache, FileSystem conf). heap dump는 범위 밖 |
 | G-27 단일 principal | 모든 Dremio 사용자가 source의 principal 하나로 Polaris에 접근한다 (`hasAccessPermission()`은 항상 true) | 최소 권한 principal 예시는 [phase3-oauth-catalog.md](phase3-oauth-catalog.md) §4.3. Phase 6 문서 |
 | allowedNamespaces는 접근 제어가 아님 | 직접 경로로 SELECT/CREATE하면 allow list 밖도 접근된다 (C B-2) | Polaris grant로 권한을 제한한다. 강제 여부는 Phase 5/6 결정 |
@@ -149,13 +151,13 @@ Marker: `Bearer `, `access_token`, `client_secret`, `s3.secret-access-key`, `s3.
 | `sys.jobs`, `sys.jobs_recent`(query text, error), `INFORMATION_SCHEMA`, `sys.options` | 0 | 0 | 0 | 0/0/0 | 0 | PASS (`sys.sources`는 OSS에 없음) |
 | Dremio log, 기본 level | 0 | 0 | 0 | – | 0 | PASS |
 | Dremio log, DEBUG(icebergcatalog, iceberg, s3, s3a) + 회전 `.gz` + `admin_encrypt_*.log` | 0 | 0 | 0 | 0/0/0 | 0 | PASS |
-| KV store `data/db` | **평문** | **평문** | 잘못된 S3 secret 평문 2 (저장된 source) | 0/0/0 | 0 | 기록 (G-12). vended 값은 저장되지 않는다 |
+| KV store `data/db` | **평문** | **평문** | 잘못된 S3 secret 평문 2 (저장된 source) | 0/0/0 | 0 | NOT_SUPPORTED (G-12/X-01: at-rest 암호화는 기본 미지원, `dremio-admin encrypt`로 완화). vended 값은 저장되지 않는다 |
 | KV store, `dremio-admin encrypt` 값 source | 암호문만 | 암호문만 | – | – | – | PASS |
 | `data/pdfs`, `data/cm`, `data/zk`, `data/spill` | 0 | 0 | 0 | 0/0/0 | 0 | PASS |
 | Polaris container log | 0 | 0 | 0 | 0/0/0 | 0 | PASS |
 | Harness 출력 | 0 | 0 | 0 | 0/0/0 | 0 | PASS |
 | Dremio process (`/proc/<pid>/environ`, cmdline) | 0 | 0 | – | – | – | PASS (`dremio-up.sh`가 `env -u`로 뺀다) |
-| `docker inspect` (Polaris container) | root secret 1 | 1 | – | – | – | 기록 (harness가 env로 전달, 로컬 전용) |
+| `docker inspect` (Polaris container) | root secret 1 | 1 | – | – | – | NOT_SUPPORTED (X-08: 운영 경로 아님. harness가 env로 전달, 로컬 전용) |
 | HttpClient 4 `org.apache.http.headers` DEBUG (unit probe) | – | 0 | – | session token **노출** | – | FAIL → Phase 4 integration에서 `logback.xml` 고정 (§3) |
 | Netty `io.netty.handler.logging.LoggingHandler` DEBUG (SDK v2 async 읽기, unit, review) | – | 0 | – | session token **노출** | – | FAIL → review에서 `logback.xml` 고정 (§3) |
 

@@ -439,10 +439,104 @@ public class TestRestCatalogHttpErrors extends BaseTestQuery {
   }
 
   @Test
-  public void testTableExists500IsRaisedWithoutSecrets() throws Exception {
-    // Not mapped: the raw Iceberg exception (with the server message) reaches the caller.
-    Throwable thrown = datasetHandleFailure(500, "ServerError", marker(500) + " table op");
+  public void testTableExists500IsAConnectionErrorWithHint() throws Exception {
+    Throwable thrown = datasetHandleFailure(500, "ServerError", echoMessage(500));
     assertThat(chainText(thrown)).contains(marker(500));
+    assertRequestFailed(
+        thrown,
+        "reported a server error (HTTP 500) for the request to look up [ns1.t1]",
+        "echo ****",
+        RestCatalogExceptionMapper.RETRY_HINT);
+  }
+
+  @Test
+  public void testTableExists429IsAConnectionErrorWithHint() throws Exception {
+    Throwable thrown = datasetHandleFailure(429, "TooManyRequestsException", echoMessage(429));
+    assertThat(chainText(thrown)).contains(marker(429));
+    assertRequestFailed(
+        thrown,
+        "returned an unexpected HTTP error for the request to look up [ns1.t1]",
+        "echo ****",
+        "429 (Too Many Requests)",
+        "'rest.client.max-retries'");
+  }
+
+  @Test
+  public void testTableExists503IsAConnectionErrorWithHint() throws Exception {
+    Throwable thrown = datasetHandleFailure(503, "ServiceUnavailableException", echoMessage(503));
+    assertThat(chainText(thrown)).contains(marker(503));
+    assertRequestFailed(
+        thrown,
+        "is unavailable (HTTP 503) for the request to look up [ns1.t1]",
+        "echo ****",
+        RestCatalogExceptionMapper.RETRIED_NOTE,
+        RestCatalogExceptionMapper.RETRY_HINT);
+  }
+
+  @Test
+  public void testTableExists502HtmlPageIsAConnectionErrorWithHint() throws Exception {
+    Throwable thrown =
+        datasetHandleFailure(
+            "502 (html)",
+            new Response(
+                502, "text/html", "<html><body>" + marker(502) + " Bad Gateway</body></html>"),
+            "rest.client.max-retries",
+            "1");
+    assertRequestFailed(
+        thrown,
+        "returned an unexpected HTTP error for the request to look up [ns1.t1]",
+        "502/504 from a proxy");
+    assertThat(thrown.getMessage()).doesNotContain("<html>");
+  }
+
+  @Test
+  public void testTableExistsReadTimeoutIsAConnectionErrorWithHint() throws Exception {
+    Throwable thrown =
+        datasetHandleFailure(
+            "read timeout",
+            Response.json(200, "{}").withDelayMs(3000),
+            "rest.client.socket-timeout-ms",
+            "300");
+    assertRequestFailed(
+        thrown,
+        "did not respond in time to the request to look up [ns1.t1]",
+        "timed out",
+        "'rest.client.socket-timeout-ms'");
+  }
+
+  @Test
+  public void testTableExistsDroppedConnectionIsAConnectionErrorWithHint() throws Exception {
+    Throwable thrown =
+        datasetHandleFailure(
+            "connection dropped", Response.dropConnection(), "rest.client.max-retries", "1");
+    assertRequestFailed(
+        thrown,
+        "connection to the Iceberg REST catalog failed during the request to look up [ns1.t1]",
+        RestCatalogExceptionMapper.CONNECTION_RETRIED_NOTE);
+  }
+
+  @Test
+  public void testTableExistsOnStoppedCatalogIsAConnectionErrorWithHint() throws Exception {
+    RestIcebergCatalogPlugin plugin;
+    try (FakeRestCatalogServer server = FakeRestCatalogServer.http()) {
+      // Starts against a healthy catalog, which then stops (connection refused).
+      plugin = startPlugin(server.baseUri(), "rest.client.max-retries", "1");
+    }
+    Throwable thrown = null;
+    try {
+      plugin.getDatasetHandle(new EntityPath(Arrays.asList(SOURCE_NAME, "ns1", "t1")));
+      fail("expected a failure for a stopped catalog");
+    } catch (RuntimeException e) {
+      thrown = e;
+    } finally {
+      plugin.close();
+    }
+    logger.info("P3-MATRIX tableExists stopped catalog -> {}", thrown.getMessage());
+    assertRequestFailed(
+        thrown,
+        "Unable to reach the Iceberg REST catalog for the request to look up [ns1.t1]",
+        RestCatalogExceptionMapper.UNREACHABLE_HINT);
+    logs.assertNoSecrets();
   }
 
   @Test
@@ -626,14 +720,22 @@ public class TestRestCatalogHttpErrors extends BaseTestQuery {
 
   private Throwable datasetHandleFailure(int code, String type, String serverMessage)
       throws Exception {
+    return datasetHandleFailure(
+        String.valueOf(code),
+        Response.error(code, type, serverMessage),
+        "rest.client.max-retries",
+        "1");
+  }
+
+  private Throwable datasetHandleFailure(String scenario, Response response, String... props)
+      throws Exception {
     Throwable thrown = null;
     try (FakeRestCatalogServer server = FakeRestCatalogServer.http()) {
-      server.route("*", TABLE_PATH, Response.error(code, type, serverMessage));
-      RestIcebergCatalogPlugin plugin =
-          startPlugin(server.baseUri(), "rest.client.max-retries", "1");
+      server.route("*", TABLE_PATH, response);
+      RestIcebergCatalogPlugin plugin = startPlugin(server.baseUri(), props);
       try {
         plugin.getDatasetHandle(new EntityPath(Arrays.asList(SOURCE_NAME, "ns1", "t1")));
-        fail("expected a failure for HTTP " + code);
+        fail("expected a failure for " + scenario);
       } catch (RuntimeException e) {
         thrown = e;
       } finally {
@@ -647,10 +749,19 @@ public class TestRestCatalogHttpErrors extends BaseTestQuery {
     logs.assertNoSecrets();
     logger.info(
         "P3-MATRIX tableExists {} -> {}: {}",
-        code,
+        scenario,
         thrown.getClass().getName(),
         thrown.getMessage());
     return thrown;
+  }
+
+  /** A connection error (not the raw Iceberg exception) whose message has all the fragments. */
+  private static void assertRequestFailed(Throwable thrown, String... fragments) {
+    assertThat(thrown).isInstanceOf(UserException.class);
+    assertEquals(ErrorType.CONNECTION, ((UserException) thrown).getErrorType());
+    for (String fragment : fragments) {
+      assertThat(thrown.getMessage()).contains(fragment);
+    }
   }
 
   /** Class names and messages of the exception and its causes (raw or mapped to UserException). */
@@ -918,6 +1029,11 @@ public class TestRestCatalogHttpErrors extends BaseTestQuery {
               + "}}");
     }
 
+    /** Closes the connection after reading the request, without any response. */
+    static Response dropConnection() {
+      return new Response(-1, "text/plain", "");
+    }
+
     /** OAuth2 (RFC 6749 section 5.2) error. */
     static Response oauthError(int status, String error, String description) {
       return json(
@@ -1062,6 +1178,9 @@ public class TestRestCatalogHttpErrors extends BaseTestQuery {
         Response response = match(request);
         if (response.delayMs > 0) {
           Thread.sleep(response.delayMs);
+        }
+        if (response.status < 0) {
+          return;
         }
         byte[] body =
             "HEAD".equals(request.method)

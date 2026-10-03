@@ -1,7 +1,7 @@
 # Polaris RESTCATALOG Test Results
 
-- Status 값: `PASS` / `FAIL` / `ENVIRONMENT_BLOCKED` / `NOT_SUPPORTED`. 아직 채우지 않은 칸은 `TBD`. 해당 Phase에서 실행하지 않은 항목은 `N/A` 또는 이월 표시를 하고 집계에서 뺀다.
-- Phase 1–4는 [progress.md](progress.md)와 Phase 문서에 기록된 결과를 옮긴 것이다. Phase 5는 Agent A(lifecycle), B(read), C(write, namespace/view), E(cache/metadata), F(장애/regression), G(UI) 보고와 Integration 재검증(INSTANCE=7)을 옮긴 것이다.
+- Status 값: `PASS` / `FAIL` / `ENVIRONMENT_BLOCKED` / `NOT_SUPPORTED`. 해당 Phase에서 실행하지 않은 항목은 `N/A` 또는 이월 표시를 하고 집계에서 뺀다.
+- Phase 1–4는 [progress.md](progress.md)와 Phase 문서에 기록된 결과를 옮긴 것이다. Phase 5는 Agent A(lifecycle), B(read), C(write, namespace/view), E(cache/metadata), F(장애/regression), G(UI) 보고와 Integration 재검증(INSTANCE=7)을 옮긴 것이다. Phase 6은 Fix, Release build, Structure audit 보고와 Integration 최종 검증(INSTANCE=3)이다 (§7).
 - 환경 공통: Apache Polaris `apache/polaris:1.1.0-incubating`, Iceberg `1.7.0-5f7c992-20250730084652-3bf8b99` (Dremio fork), 로컬 MinIO (plain HTTP, region `us-east-1`), TLS/region 검증용 throwaway MinIO(`bitnamilegacy/minio`), Dremio tarball(single node, JDK 17 runtime), build JDK 21 / test JDK 11. AWS 계정 없음.
 - Live 실행은 `scripts/polaris-e2e` harness를 쓴다 ([README](../../scripts/polaris-e2e/README.md)). Secret은 환경 변수로만 넘기고, 결과에는 건수만 남긴다.
 
@@ -13,7 +13,8 @@
 | 2 | RESTCATALOG OSS Source | 신규 89, module 182, UI spec 103 passing / 9 pending | local `full` SUCCESS (원격 QUEUED) | live gate 19항목 (§2) | `f2553db4a` (+ `ffd1cc1b2`) |
 | 3 | OAuth2 / Catalog 연동 | 신규/변경 251, module 319 | local `full` SUCCESS, 원격 `16c8597a` SUCCESS | INSTANCE=1–6 PASS | `3b85d3619` |
 | 4 | Object Storage | 신규 62 + `TestS3FileSystem` 25, module 381 + `plugins/s3` 112 | local `full` SUCCESS, 원격 `d2dfe26e` SUCCESS | INSTANCE=1–6 PASS (MinIO), AWS ENVIRONMENT_BLOCKED | `691f2b5a9` |
-| 5 | 실제 E2E / Regression | 신규 5 (CTAS 3, layout 1, config 재시작 조건 1) + flaky test 수정 1, module 386, `plugins/s3` 112, `dac/backend` 78, UI spec 103 passing / 9 pending | local `full` SUCCESS (2차와 review 수정 뒤 3차; 1차는 flaky TLS test로 FAILED → test 수정), 원격은 Lead | INSTANCE=1–7: PASS 139, FAIL 8 (kernel K-01 3, known C-08 3, known K-15 1, minor 1), NOT_SUPPORTED 5 (§5) | TBD (Lead) |
+| 5 | 실제 E2E / Regression | 신규 5 (CTAS 3, layout 1, config 재시작 조건 1) + flaky test 수정 1, module 386, `plugins/s3` 112, `dac/backend` 78, UI spec 103 passing / 9 pending | local `full` SUCCESS (2차와 review 수정 뒤 3차; 1차는 flaky TLS test로 FAILED → test 수정), 원격은 Lead | INSTANCE=1–7: PASS 139, FAIL 8 (kernel K-01 3, known C-08 3, known K-15 1, minor 1), NOT_SUPPORTED 5 (§5) | `6d2f6f4e9` |
+| 6 | 최종 통합 / Release Readiness | 신규 26 (icebergcatalog, 최종 review 3 포함) + kernel 2, module 412, `sabot/kernel` `TestManagedStoragePlugin`+`TestPluginsManager` 34 | local `full --no-cache` SUCCESS (6 step) | release smoke 12/12 (INSTANCE=2, Release Agent), 최종 tarball smoke 12/12 + P6-2–P6-8 7/7 (INSTANCE=3) (§7) | Lead 기록 |
 
 ## 1. Phase 1 — 구조 분석
 
@@ -447,10 +448,119 @@ AbleOps Local CI (`localci run --profile full --no-cache`). Review 수정 뒤 3�
 | CREATE TABLE / CTAS | Phase 5 C-1–C-8, C-26 (partitioned CTAS는 수정 후) | PASS |
 | INSERT (+UPDATE/DELETE/MERGE) | Phase 5 C-9, C-14, C-24, C-25 | PASS |
 | Polaris + S3/MinIO | Phase 4 (MinIO), Phase 5 전 영역. AWS S3는 ENVIRONMENT_BLOCKED | PASS (MinIO) / ENVIRONMENT_BLOCKED (AWS) |
-| Source restart / reload | Phase 5 A-6–A-10, A-21, E-23, F-4. update 실패 뒤 background refresh 정지는 kernel K-01 (재시작으로 복구) | PASS (K-01 제약) |
+| Source restart / reload | Phase 5 A-6–A-10, A-21, E-23, F-4. update 실패 뒤 background refresh 정지(kernel K-01)는 Phase 6에서 수정 (unit, live P6-6) | PASS |
 | allowedNamespaces | Phase 3 matrix, Phase 5 A-4 | PASS (discovery 범위만, N-01) |
-| Secret masking | Phase 2–4, Phase 5 A-2/A-23, E-23, F-15, U-7/U-13, I-7 (모두 0건) | PASS |
-| Generic RESTCATALOG 회귀 없음 | Phase 5 §5.7 (iceberg-rest-fixture E2E, module 386, s3 112, dac/backend 78, UI spec) | PASS |
-| Unit / integration / E2E | Phase 2–5 unit, harness E2E 7개 instance | PASS |
+| Secret masking | Phase 2–4, Phase 5 A-2/A-23, E-23, F-15, U-7/U-13, I-7, Phase 6 P6-8 (모두 0건) | PASS |
+| Generic RESTCATALOG 회귀 없음 | Phase 5 §5.7 (iceberg-rest-fixture E2E, module 386, s3 112, dac/backend 78, UI spec), Phase 6 module 412, s3 112, UI spec 103 (Local CI) | PASS |
+| Unit / integration / E2E | Phase 2–6 unit, harness E2E 7개 instance (Phase 5) + release tarball smoke 2회 (Phase 6) | PASS |
+| Release packaging | Phase 6 §7.2: `dac/ui` 포함 Maven build, 새 UI bundle 1개, plugin/kernel/s3 jar md5 일치, logback 고정, pom 변경 없음 | PASS |
 
-남은 결함과 제약은 [known-limitations.md](known-limitations.md)에 있다. Phase 5에서 FAIL로 남은 항목은 kernel K-01(A-18–A-20), 알려진 결함 C-08(F-12–F-14: table lookup/load 경로의 429/5xx/timeout raw 메시지)과 K-15(F-5: 기본 S3A 재시도의 storage down hang, 설정으로 완화), `DROP TABLE IF EXISTS` 메시지(C-22, minor)다. F의 네 건은 장애 해제 뒤 복구는 정상이다.
+남은 결함과 제약은 [known-limitations.md](known-limitations.md)에 있다. Phase 6에서 C-08(F-12–F-14), C-17(C-22), K-01(A-18–A-20)을 고쳤다. 남은 known FAIL은 K-15(F-5: 기본 S3A 재시도의 storage down hang, 설정으로 완화), C-04, C-06, C-16, K-11, N-04(upstream)이다. 아래는 Phase 5 시점의 기록이다: Phase 5에서 FAIL로 남은 항목은 kernel K-01(A-18–A-20), 알려진 결함 C-08(F-12–F-14: table lookup/load 경로의 429/5xx/timeout raw 메시지)과 K-15(F-5: 기본 S3A 재시도의 storage down hang, 설정으로 완화), `DROP TABLE IF EXISTS` 메시지(C-22, minor)다. F의 네 건은 장애 해제 뒤 복구는 정상이다.
+
+## 7. Phase 6 — 최종 통합 / Release Readiness
+
+### 7.1 Code 변경과 unit
+
+| 구분 | 변경 | 검증 |
+|---|---|---|
+| C-08 (plugin) | `RestCatalogExceptionMapper.requestFailed`: dataset lookup, load table/view(cache 여부 무관), storage credential 조회, drop table의 `RESTException`을 CONNECTION ERROR + 원인별 hint로 (unreachable, TLS, timeout, connection reset, 500, 503, 그 밖 status). Server message와 cause는 redact, HTML 제거, 300자 제한 | `TestRestCatalogHttpErrors`(fake HTTP catalog: 500, 429, 503, 502 HTML, read timeout, 연결 끊김, 중지된 catalog, secret masking), `TestRestCatalogNamespaceTableOps` |
+| C-08 보완 (Integration) | `BadRequestException`(400)과 `UnprocessableEntityException`(422)도 `RESTException` 하위라 "unexpected HTTP error (not 400 …)"로 잘못 분류되던 것을 VALIDATION ERROR "rejected the request … as invalid (HTTP 400/422)"로. HTML만 있는 server message에서 `asSentence`가 빈 문자열로 실패하던 것을 예외 type 이름으로 | `testLoadTableBadRequestIsValidationError`, `testRequestFailedWithMarkupOnlyMessageNamesTheExceptionType` |
+| 401 매핑 확장 (audit M1) | create table, create/drop/replace view(존재 확인 포함), CTAS staging, create/drop folder, drop table, commit(`CommitNotAuthorizedException`, `NotAuthorizedException` 하위라 `CleanableFailure` 유지)의 401을 PERMISSION ERROR + credential hint로 | `testNotAuthorizedOnWriteOperationsIsPermissionError`, `testCommitNotAuthorizedIsPermissionError` |
+| C-17 (plugin) | `dropTable`이 `false`(404)와 없는 namespace를 `NoSuchTableException`으로. Plugin은 Dremio catalog에 entry가 없으면 "Table [<path>] not found", 있으면 성공 처리 (외부에서 지운 table 정리, design.md D-16) | `TestRestCatalogNamespaceTableOps` 3, `TestRestIcebergCatalogPlugin` 2 |
+| K-01 (kernel) | `ManagedStoragePlugin.replacePlugin`/`replacePluginDeprecated`가 `startReplacementAsync(config, skipEqualityCheck)`. 시작 실패 시 metadata manager는 생성 경로에서만 닫는다 (design.md D-17) | `TestManagedStoragePlugin.testFailedUpdateKeepsMetadataRefreshScheduled`(두 update 경로), `testFailedCreateCancelsMetadataRefresh`. Fix Agent가 수정을 되돌리면 update test가 실패하는 것을 확인 |
+| Log redaction (audit M4) | Listing 오류: ERROR + stack trace → WARN 한 줄(redact된 message) + DEBUG stack trace. DEBUG로 넘기는 예외는 `redactedForLogging`(cause chain에 secret이 있으면 redact된 message + 원래 stack trace만) | `testRedactedForLoggingDropsSecretsFromTheCauseChain` |
+| Sensitive key 동기화 (audit M6) | backend 규칙을 상수(`SENSITIVE_PROPERTY_KEYS`, `SENSITIVE_KEY_SUBSTRINGS`, `SENSITIVE_KEY_SUFFIXES`)로 정리하고, `dac/ui/src/utils/sourceUtils.ts`의 같은 이름 배열과 비교하는 test 추가 (UI source가 없으면 skip). 규칙 자체는 바꾸지 않았다 (`rest.access-key-id`, bucket별 access key는 known-limitations X-10) | `testSensitiveKeyRuleIsInSyncWithUi` (Local CI에서도 실행, skip 0) |
+| 정리 (audit M3, low) | test/Javadoc의 실제 MinIO access key ID를 placeholder로, `CommitForbiddenException.getPermissionError()`(미사용) 삭제, `S3A_CREDENTIALS_PROVIDER` 중복 상수 제거, `closeQuietly` 하나로(`ExpiringCatalogCache`, DEBUG), 중복 WARN 문구 helper로, `G-07:` 주석 tag 제거, `isRecursiveAllowedNamespaces` Javadoc 수정·annotation 위로 이동 | module test |
+
+Audit 항목 중 바꾸지 않은 것과 이유:
+- `RestIcebergCatalogPlugin.deleteFolder`의 `!isDeleted` 분기와 `createFolder`의 `ForbiddenException` catch: upstream 26.0.5 code이고 `CatalogAccessor` 계약(다른 구현)을 위한 방어 code라 그대로 둔다.
+- `buildCatalogProperties`의 `applyConfigPropertiesToFsConf` 재호출: `createCatalog`를 거치지 않고 `buildCatalogProperties`를 직접 부르는 경로(subclass, test)도 fs conf를 채워야 하므로 유지 (idempotent).
+- Backend의 빈 property 값 허용: `fs.s3a.aws.credentials.provider=`(빈 값)이 host identity opt-in이라 유지 (known-limitations X-11).
+- UI `SENSITIVE_PROPERTY_KEYS` export, layout placeholder의 Polaris URL: UI/layout 변경은 release UI jar를 다시 만들어야 해서 하지 않았다 (기능 영향 없음).
+- Screenshot 3장 재촬영: 하지 않았다 (configuration.md §1 주의 문구 유지).
+- `.localci.yaml`의 절대 경로(`DREMIO_NODE_MODULES`, `DREMIO_UI_NODE_DIR`): 로컬 Agent 전용 설정이라 유지.
+
+| 범위 | 결과 |
+|---|---|
+| `scripts/dev test plugins/icebergcatalog` | 409 tests, 0 failures, 0 errors, 0 skipped (Phase 5 386 + Fix 17 + Integration 6). 최종 review 반영 뒤 412 (§7.5) |
+| `scripts/dev test TestManagedStoragePlugin TestPluginsManager` (`sabot/kernel`) | 34 tests, 0 failures (14 + 20) |
+| `scripts/dev fmt`, `scripts/dev lint` (`plugins/icebergcatalog`, `sabot/kernel`) | BUILD SUCCESS |
+| errorprone / forbiddenapis | icebergcatalog: Local CI `icebergcatalog-static` SUCCESS (Fix 단계에서 `FormatStringAnnotation` 1건 수정). `sabot/kernel`은 errorprone을 실행하지 않았다 (변경은 private method 1개와 호출 2곳) |
+| `git diff`와 신규 파일의 MinIO secret | 0건 |
+
+### 7.2 Release build
+
+Release Agent가 `dac/ui`를 `-Ddremio.no-ui` 없이 Maven install(webpack production bundle)한 뒤 `distribution/server`를 build했다. 첫 build에서 `dac/ui/target/classes`에 남은 이전 bundle(`app.fee6e290.js`, Polaris 문자열 없음, `index.html`이 가리키지 않음)이 jar에 같이 들어가 그 file을 지우고 다시 build했다 (`clean`은 쓰지 않음). Integration은 Fix/audit 반영 code로 `sabot/kernel`, `plugins/icebergcatalog`, `distribution/server`를 다시 build했고 UI jar는 Release build의 것을 그대로 썼다.
+
+| 확인 | 결과 | Status |
+|---|---|---|
+| 최종 tarball | `distribution/server/target/dremio-community-26.0.5-202509091642240013-f5051a07.tar.gz`, 905,759,568 bytes, md5 `410d54ef74edf36e4a4a48370da04138` | PASS |
+| UI jar (`jars/dremio-dac-ui-*.jar`) | md5 `4312b20c2a570e557ff679eb83a02a7d` (Release build와 같음). `static/js/app.*.js`는 `app.a4aa0288.js` 하나, `index.html`이 가리키는 file, "Apache Polaris OSS" 포함 | PASS |
+| icebergcatalog plugin jar | md5 `769370ad16ba6b3403c2d0b65a5617e6` = `~/.m2`. `RestCatalogExceptionMapper.requestFailed`/`redactedForLogging`, `CommitNotAuthorizedException` class 포함 | PASS |
+| kernel jar | md5 `95c5243e35a28f0dbdc829c5f912eb46` = `~/.m2`. `ManagedStoragePlugin.startReplacementAsync` 포함 | PASS |
+| s3 plugin jar | Release build에서 확인: endpoint scheme 수정 포함, md5 = module/`~/.m2` (Phase 6에서 `plugins/s3` 변경 없음) | PASS |
+| `conf/logback.xml` | HEAD와 같음. HttpClient 4/5 wire·headers, SigV4 signer 2개, AWS4Signer, Netty logger 2개 INFO 고정 | PASS |
+| 중복 RESTCATALOG class / prototype jar | 없음 (`RestIcebergCatalogPlugin`과 config는 icebergcatalog jar에만) | PASS |
+| Maven dependency | `git diff 799ccbda4 -- '*pom.xml'` 비어 있음. 새 third-party dependency/license 없음 | PASS |
+
+### 7.3 Release smoke와 최종 smoke
+
+Release Agent: Fix 반영 전 tarball(HEAD=P5 code)을 새로 풀어 INSTANCE=2 `smoke.sh` 12/12 PASS, 서빙된 UI(`GET /` → `app.a4aa0288.js`, "Apache Polaris OSS") PASS, secret scan 0, 정리 완료 (158초).
+
+Integration 최종 검증 (INSTANCE=3, 최종 tarball을 scratchpad에 새로 풀어 실행, container prefix `p6-`, S3 prefix `polaris-p6-final`, names refresh 60초):
+
+| # | 시나리오 | 결과 | Status |
+|---|---|---|---|
+| P6-1 | `smoke.sh` (source 생성 `good`, Polaris API로 만든 namespace/table이 Dremio에 보임, SELECT, CREATE TABLE, INSERT, SELECT 2 rows, Polaris가 t1을 나열, DROP TABLE, secret scan) | 12/12 PASS, 157초 | PASS |
+| P6-2 | 서빙된 UI | `GET /` → `/static/js/app.a4aa0288.js`, "Apache Polaris OSS" 포함 | PASS |
+| P6-3 | `DROP TABLE IF EXISTS polaris.smoke.nosuch` (C-17) | COMPLETED, "Table [polaris.smoke.nosuch] not found." (Phase 5 C-22는 "dropped") | PASS |
+| P6-4 | `DROP TABLE polaris.smoke.nosuch` | FAILED "Table [polaris.smoke.nosuch] does not exist." (filesystem source와 같은 handler 오류. 검사 script의 문구 기대값("not found")이 틀려 script는 FAIL로 찍었고, 결과는 확인 후 PASS로 판정) | PASS |
+| P6-5 | Polaris container 중지 직후 `SELECT * FROM polaris.smoke.polaris_t` (C-08) | FAILED "Unable to reach the Iceberg REST catalog for the request to load table [smoke.polaris_t]: Error occurred while processing GET request (Connect to http://127.0.0.1:18211 … failed: …). Check the endpoint URI, the network connectivity and that the catalog service is up, then retry the query." (Phase 5 F-12–F-14는 raw 메시지) | PASS |
+| P6-6 | 잘못된 credential로 source update 후 background refresh (K-01) | update HTTP 400 + OAuth2 hint, state `good` 유지. 이후 Polaris에 만든 namespace `k01ns`가 **40초** 뒤 names refresh로 Dremio에 보임 (Phase 5 A-18–A-20은 재시작 전까지 안 보임) | PASS |
+| P6-7 | `ROLLBACK TABLE … TO SNAPSHOT` (C-25) | INSERT 2회(snapshot 2개) 뒤 첫 snapshot으로 "Table [polaris.smoke.rb] rollbacked", SELECT 1 row | PASS |
+| P6-8 | Secret scan (Dremio log 전체, Polaris container log: S3 secret, Polaris root secret, `Bearer`, `access_token`, `client_secret`, `s3.secret-access-key`, `s3.session-token`) | total 0. Build/smoke/Local CI log의 MinIO secret 0건 | PASS |
+
+정리: source 삭제(204), Dremio 중지와 work dir 삭제, `p6-polaris-e2e-3` 삭제, `s3://dremiodev/polaris-p6-final/` object 16개 삭제(남은 0), 압축 해제 디렉터리 삭제. 남은 `p6-` container 0, INSTANCE=3 port 모두 해제. 사용자 MinIO는 중지하지 않았다.
+
+### 7.4 AbleOps Local CI
+
+`localci run --profile full --no-cache` (local mode, Phase 6 최종 review 반영 code, log `target/dev/localci-phase6-final.log`, wall 2분 21초). 그 전 실행(`target/dev/localci-phase6.log`, 409 tests, wall 2분 16초)도 모두 SUCCESS였다. 원격 `localci submit` 결과와 SHA는 Lead가 기록한다.
+
+| 구분 | Step | 결과 |
+|---|---|---|
+| 컴파일 + 테스트 | `icebergcatalog-test` | SUCCESS (412 tests, 0 failures, 0 skipped) |
+| 컴파일 + 테스트 | `s3-test` | SUCCESS (112 tests, 0 failures, 0 skipped) |
+| lint | `icebergcatalog-lint` (spotless, license, checkstyle; icebergcatalog + s3) | SUCCESS (0 violations) |
+| 후속: 정적 분석 | `icebergcatalog-static` (errorprone, forbiddenapis, enforcer) | SUCCESS |
+| 후속: UI | `ui-source-specs` | SUCCESS (103 passing, 9 pending, eslint 0 errors) |
+| 후속: harness | `e2e-harness-lint` | SUCCESS |
+
+Local CI pipeline은 `sabot/kernel`을 build/test하지 않는다. K-01 kernel 변경은 위 §7.1의 module test와 최종 tarball live(P6-6)로 확인했다.
+
+### 7.5 최종 review 반영
+
+최종 review finding 4건을 확인하고 모두 반영했다.
+
+| Finding | 확인 | 반영 |
+|---|---|---|
+| DDL 경로의 403/401 외 `RESTException`이 매핑·redact되지 않는데 design.md §5.2/security.md는 commit과 `updateFolder`만 남았다고 적음 | 맞음: create table, CTAS staging, create/drop view, view replace, create/drop folder는 403/401만 잡았다 | Code 수정: 위 경로에 `catch (RESTException e) → requestFailed`. Drop folder는 400 "not empty" 분기가 먼저이고, 그 밖 400은 raw 재throw 대신 `requestFailed`. 문서(design.md §5.2, security.md, known-limitations C-08)를 code에 맞췄다 |
+| `DROP TABLE IF EXISTS`가 catalog의 400/422 거부를 "not found" 성공으로 보고 | 맞음: `requestFailed`의 400/422는 VALIDATION ERROR이고 `DropTableHandler`가 `IF EXISTS`에서 VALIDATION ERROR를 성공으로 바꾼다 | `RestCatalogExceptionMapper.dropFailed`: drop table의 400/422는 같은 메시지의 UNSUPPORTED_OPERATION ERROR. 다른 drop(view, folder)의 handler는 VALIDATION ERROR를 삼키지 않아 그대로 둔다 |
+| Status 값이 spec의 네 값(PASS/FAIL/ENVIRONMENT_BLOCKED/NOT_SUPPORTED) 밖 (`미검증 (범위 밖)`, `기록`, `PASS (수정됨)`) | 맞음 | compatibility-matrix, known-limitations, security.md의 결과 열을 네 값으로 바꿨다. 실행하지 않은 항목은 `NOT_SUPPORTED (검증하지 않음: <이유>)`, 환경이 없던 항목은 `ENVIRONMENT_BLOCKED`. 괄호는 비고로만 쓴다고 정의했다 |
+| C-07이 401/403도 HTTP status를 표기한다고 적음 | 맞음: 401/403 메시지에는 숫자가 없다 (Phase 3 문구로 구분) | known-limitations C-07 수정 |
+
+| 범위 | 결과 |
+|---|---|
+| 신규/수정 unit (`TestRestCatalogNamespaceTableOps`) | `testRequestFailuresOnWriteOperationsAreMapped`(7개 DDL 경로의 500 → CONNECTION ERROR + action), `testCreateTableBadRequestIsValidationError`, `testDropTableRejectedRequestIsNotValidationError`(400/422 → UNSUPPORTED_OPERATION), `testDropFolderOtherBadRequestIsValidationError`(이전 `…IsRethrown`) |
+| `scripts/dev test plugins/icebergcatalog` | 412 tests, 0 failures, 0 errors, 0 skipped |
+| `scripts/dev fmt`, `scripts/dev lint` | BUILD SUCCESS (0 Checkstyle violations) |
+| Local CI `full --no-cache` | 6 step 모두 SUCCESS (§7.4) |
+
+Live 재확인 (INSTANCE=4, 최종 tarball 복사본에 새로 build한 icebergcatalog jar만 교체, container prefix `p6-`, S3 prefix `polaris-p6-final`):
+
+| # | 시나리오 | 결과 | Status |
+|---|---|---|---|
+| P6-9 | DDL 회귀: CREATE FOLDER, CREATE TABLE, INSERT, SELECT, CREATE VIEW, SELECT view, DROP VIEW, DROP TABLE, `DROP TABLE IF EXISTS` (없는 table), DROP FOLDER | 10/10 COMPLETED. `IF EXISTS`는 "Table [polaris.fin.nosuch] not found." | PASS |
+| P6-10 | Polaris container 중지 직후 `CREATE FOLDER polaris.fin2` | FAILED "Unable to reach the Iceberg REST catalog for the request to create folder [fin2]: Error occurred while processing POST request (Connect to http://127.0.0.1:18221 … failed: …). Check the endpoint URI, the network connectivity and that the catalog service is up, then retry the query." (수정 전에는 raw `RESTException`) | PASS |
+| P6-11 | Secret scan (Dremio log, Polaris container log) | total 0 | PASS |
+
+정리: source 삭제(204), Dremio 중지와 work dir 삭제, `p6-polaris-e2e-4` 삭제, `s3://dremiodev/polaris-p6-final/` object 6개 삭제(남은 0). 남은 `p6-` container 0, INSTANCE=4 port 해제. 사용자 MinIO는 중지하지 않았다. 400/422 거부는 Polaris에서 재현할 DDL 경로가 없어 unit으로만 확인했다.

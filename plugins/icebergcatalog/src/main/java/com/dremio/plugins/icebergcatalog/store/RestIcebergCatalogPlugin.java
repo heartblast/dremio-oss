@@ -20,6 +20,7 @@ import static com.dremio.exec.catalog.CatalogOptions.RESTCATALOG_VIEWS_SUPPORTED
 import static com.dremio.exec.store.IcebergCatalogPluginOptions.RESTCATALOG_PLUGIN_ENABLED;
 import static com.dremio.exec.store.IcebergCatalogPluginOptions.RESTCATALOG_PLUGIN_MUTABLE_ENABLED;
 import static com.dremio.plugins.icebergcatalog.store.IcebergCatalogPluginUtils.NAMESPACE_SEPARATOR;
+import static com.dremio.service.users.SystemUser.SYSTEM_USERNAME;
 
 import com.dremio.catalog.exception.CatalogEntityAlreadyExistsException;
 import com.dremio.catalog.exception.CatalogEntityForbiddenException;
@@ -70,13 +71,16 @@ import com.dremio.plugins.icebergcatalog.dfs.DatasetFileSystemCache;
 import com.dremio.sabot.exec.context.OperatorContext;
 import com.dremio.service.namespace.NamespaceAttribute;
 import com.dremio.service.namespace.NamespaceKey;
+import com.dremio.service.namespace.NamespaceService;
 import com.dremio.service.namespace.SourceState;
 import com.dremio.service.namespace.dataset.proto.DatasetConfig;
+import com.dremio.service.namespace.proto.NameSpaceContainer;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Suppliers;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import java.io.IOException;
@@ -148,8 +152,8 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
   public static final String VENDED_CREDENTIALS_DELEGATION_MODE = "vended-credentials";
 
   /** Hadoop S3A property naming the AWS credentials provider of Dremio's S3 file system. */
-  @VisibleForTesting
-  static final String S3A_CREDENTIALS_PROVIDER = "fs.s3a.aws.credentials.provider";
+  private static final String S3A_CREDENTIALS_PROVIDER =
+      VendedStorageCredentials.FS_S3A_CREDENTIALS_PROVIDER;
 
   /**
    * Hadoop's built-in value of {@link #S3A_CREDENTIALS_PROVIDER} (core-default.xml): a chain of
@@ -179,6 +183,16 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
           "s3.access-key-id",
           "s3.secret-access-key",
           "s3.session-token");
+
+  /** Parts (lower case) of property keys whose values are secrets, see above. */
+  @VisibleForTesting
+  static final List<String> SENSITIVE_KEY_SUBSTRINGS =
+      ImmutableList.of(
+          "secret", "password", "account.key", "private.key", "private-key", "sas-token");
+
+  /** Suffixes (lower case) of property keys whose values are secrets, see above. */
+  @VisibleForTesting
+  static final List<String> SENSITIVE_KEY_SUFFIXES = ImmutableList.of(".token", "-token", "_token");
 
   /**
    * Property keys (lower case) that only configure the Iceberg REST client (authentication and
@@ -221,7 +235,7 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
   /**
    * Secret values at least this long are redacted wherever they occur. Shorter ones are only
    * redacted as a whole token (not adjacent to a letter or digit), so that e.g. an access key
-   * {@code dev} does not turn a bucket name {@code dremiodev} into {@code dremio****}.
+   * {@code minio} does not turn a bucket name {@code myminio} into {@code my****}.
    */
   private static final int MIN_SUBSTRING_REDACTED_LENGTH = 8;
 
@@ -259,6 +273,8 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
 
   private final String name;
 
+  private final PluginSabotContext sabotContext;
+
   /** Key of this source in {@link #RECENT_FAILURES}. */
   private final String failureKey;
 
@@ -287,6 +303,7 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
     this.sensitiveKeysInPropertyList = findSensitivePropertyKeys(pluginConfig.propertyList);
     this.secretValues = collectSecretValues(pluginConfig);
     this.name = name;
+    this.sabotContext = sabotContext;
     this.failureKey = name + '\n' + restEndpoint;
   }
 
@@ -341,15 +358,8 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
     }
     String k = key.trim().toLowerCase(Locale.ROOT);
     return SENSITIVE_PROPERTY_KEYS.contains(k)
-        || k.contains("secret")
-        || k.contains("password")
-        || k.contains("account.key")
-        || k.contains("private.key")
-        || k.contains("private-key")
-        || k.contains("sas-token")
-        || k.endsWith(".token")
-        || k.endsWith("-token")
-        || k.endsWith("_token");
+        || SENSITIVE_KEY_SUBSTRINGS.stream().anyMatch(k::contains)
+        || SENSITIVE_KEY_SUFFIXES.stream().anyMatch(k::endsWith);
   }
 
   /** Returns the names (never values) of sensitive keys present in the given property list. */
@@ -966,8 +976,8 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
 
   @Override
   public CatalogAccessor createCatalog(Configuration config) {
-    // G-07: make the storage settings (fs.s3a.* etc.) visible in the plugin's Hadoop configuration
-    // right away, instead of only as a side effect of the lazy REST catalog build.
+    // Make the storage settings (fs.s3a.* etc.) visible in the plugin's Hadoop configuration right
+    // away, instead of only as a side effect of the lazy REST catalog build.
     applyConfigPropertiesToFsConf(config);
     try {
       return new IcebergRestCatalogAccessor(
@@ -1358,10 +1368,33 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
     try {
       getCatalogAccessor().dropTable(tableSchemaPath.getPathComponents());
     } catch (NoSuchTableException e) {
-      throw new CatalogEntityNotFoundException(
-          String.format("Table %s not found", tableSchemaPath.getName()));
+      if (!isDatasetKnownToDremio(tableSchemaPath)) {
+        // Nothing to drop: DROP TABLE fails and DROP TABLE IF EXISTS reports "not found", as for
+        // the other sources.
+        throw new CatalogEntityNotFoundException(
+            String.format("Table [%s] not found", tableSchemaPath));
+      }
+      // The table was dropped outside Dremio, but Dremio still lists it until the next refresh of
+      // the source's dataset names. Let the drop succeed so that Dremio removes its entry.
+      logger.info(
+          "Table {} no longer exists in Iceberg REST catalog source {} (dropped outside Dremio);"
+              + " removing Dremio's entry for it.",
+          tableSchemaPath,
+          name);
     }
     forgetTableStorage(tableSchemaPath.getPathComponents());
+  }
+
+  /** Whether Dremio's catalog has an entry (e.g. from a names refresh) for the dataset. */
+  private boolean isDatasetKnownToDremio(NamespaceKey key) {
+    try {
+      NamespaceService namespaceService = sabotContext.getNamespaceService(SYSTEM_USERNAME);
+      return namespaceService != null
+          && namespaceService.exists(key, NameSpaceContainer.Type.DATASET);
+    } catch (RuntimeException e) {
+      logger.debug("Could not check whether Dremio has an entry for dataset {}", key, e);
+      return false;
+    }
   }
 
   @Override

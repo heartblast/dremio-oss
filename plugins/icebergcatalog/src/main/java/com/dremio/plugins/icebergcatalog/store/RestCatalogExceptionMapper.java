@@ -17,11 +17,18 @@ package com.dremio.plugins.icebergcatalog.store;
 
 import com.dremio.common.exceptions.UserException;
 import com.google.common.annotations.VisibleForTesting;
+import java.io.IOException;
+import java.io.InterruptedIOException;
+import java.net.ConnectException;
+import java.net.NoRouteToHostException;
+import java.net.UnknownHostException;
 import java.util.Arrays;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.function.UnaryOperator;
 import java.util.regex.Pattern;
+import javax.annotation.Nullable;
+import javax.net.ssl.SSLException;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
@@ -30,6 +37,10 @@ import org.apache.iceberg.exceptions.ForbiddenException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NotAuthorizedException;
+import org.apache.iceberg.exceptions.RESTException;
+import org.apache.iceberg.exceptions.ServiceFailureException;
+import org.apache.iceberg.exceptions.ServiceUnavailableException;
+import org.apache.iceberg.exceptions.UnprocessableEntityException;
 
 /**
  * Maps exceptions raised by an Iceberg REST catalog client into {@link UserException}s with a clear
@@ -59,6 +70,39 @@ final class RestCatalogExceptionMapper {
       "Check the 'credential' (or 'token') catalog credential and the 'oauth2-server-uri' catalog"
           + " property. The source state check replaces a client whose session the catalog no"
           + " longer accepts (for example after the catalog restarted), so retry in a minute.";
+
+  static final String RETRY_HINT =
+      "Check the health and logs of the catalog service (and of any proxy in front of it), then"
+          + " retry the query.";
+
+  static final String TIMEOUT_HINT =
+      "Check that the catalog service is up and responsive, then retry the query. The client"
+          + " timeouts can be set with the catalog properties 'rest.client.connection-timeout-ms'"
+          + " and 'rest.client.socket-timeout-ms'.";
+
+  static final String UNREACHABLE_HINT =
+      "Check the endpoint URI, the network connectivity and that the catalog service is up, then"
+          + " retry the query.";
+
+  static final String TLS_HINT =
+      "Check that the endpoint scheme (http or https) matches the catalog service and that its"
+          + " certificate is trusted by the Dremio JVM (javax.net.ssl.trustStore).";
+
+  static final String RETRIED_NOTE =
+      "The client already retried the request up to 'rest.client.max-retries' times (catalog"
+          + " property, 5 by default).";
+
+  static final String CONNECTION_RETRIED_NOTE =
+      "The client retries most such failures (for example a connection reset or closed by a proxy)"
+          + " up to 'rest.client.max-retries' times (catalog property, 5 by default).";
+
+  static final String UNCLASSIFIED_STATUS_NOTE =
+      "The HTTP status is not 400, 401, 403, 404, 500 or 503: for example 429 (Too Many Requests)"
+          + " when the catalog limits the request rate, or 502/504 from a proxy. 429, 502, 503 and"
+          + " 504 are retried up to 'rest.client.max-retries' times (catalog property, 5 by"
+          + " default) before the request fails. Wait a moment and retry; if it persists, lower the"
+          + " request rate or check the logs of the catalog service and of any proxy in front of"
+          + " it.";
 
   private static final Pattern HTML_TAG = Pattern.compile("<[^<>]{1,200}>");
 
@@ -122,12 +166,140 @@ final class RestCatalogExceptionMapper {
         .buildSilently();
   }
 
+  /** Same as {@link #requestFailed(RESTException, String, Object, UnaryOperator)}, no redaction. */
+  @VisibleForTesting
+  static UserException requestFailed(RESTException e, String action, Object entity) {
+    return requestFailed(e, action, entity, UnaryOperator.identity());
+  }
+
+  /**
+   * Maps a failed REST catalog request that is not about the request itself to a connection error
+   * with the likely cause and retry advice, in the style of the source state messages: HTTP 500
+   * ({@link ServiceFailureException}), HTTP 503 after the client retries ({@link
+   * ServiceUnavailableException}), timeouts, network and TLS failures, and every HTTP status that
+   * the Iceberg REST client does not classify (for example 429, 502 and 504, which it reports as a
+   * plain {@link RESTException} without the status code). A request that the catalog rejects as
+   * invalid (HTTP 400 {@link BadRequestException}, HTTP 422 {@link UnprocessableEntityException},
+   * both {@link RESTException}s too) is a validation error instead. See {@link
+   * #forbidden(ForbiddenException, String, Object, UnaryOperator)} for the parameters.
+   */
+  static UserException requestFailed(
+      RESTException e, String action, Object entity, UnaryOperator<String> redactor) {
+    if (isRejectedRequest(e)) {
+      // The catalog rejected the request itself (HTTP 400 or 422): retrying does not help.
+      return rejectedRequest(
+          UserException.validationError(redactedCause(e, redactor)), e, action, entity, redactor);
+    }
+    IOException ioFailure = findCause(e, IOException.class);
+    String prefix;
+    String hint;
+    if (findNetworkCause(e) != null) {
+      prefix = "Unable to reach the Iceberg REST catalog for the request to";
+      hint = UNREACHABLE_HINT;
+    } else if (ioFailure instanceof SSLException) {
+      prefix = "The TLS connection to the Iceberg REST catalog failed for the request to";
+      hint = TLS_HINT;
+    } else if (ioFailure instanceof InterruptedIOException) {
+      prefix = "The Iceberg REST catalog did not respond in time to the request to";
+      hint = TIMEOUT_HINT;
+    } else if (ioFailure != null) {
+      prefix = "The connection to the Iceberg REST catalog failed during the request to";
+      hint = CONNECTION_RETRIED_NOTE + " " + RETRY_HINT;
+    } else if (e instanceof ServiceFailureException) {
+      prefix = "The Iceberg REST catalog reported a server error (HTTP 500) for the request to";
+      hint = RETRY_HINT;
+    } else if (e instanceof ServiceUnavailableException) {
+      prefix = "The Iceberg REST catalog is unavailable (HTTP 503) for the request to";
+      hint = RETRIED_NOTE + " " + RETRY_HINT;
+    } else {
+      prefix = "The Iceberg REST catalog returned an unexpected HTTP error for the request to";
+      hint = UNCLASSIFIED_STATUS_NOTE;
+    }
+    String detail = redactedServerMessage(e, redactor);
+    if (ioFailure != null) {
+      detail = detail + " (" + redactedServerMessage(ioFailure, redactor) + ")";
+    }
+    return UserException.connectionError(redactedCause(e, redactor))
+        .message("%s %s %s: %s %s", prefix, action, entity, asSentence(detail), hint)
+        .addContext("Action", action + " " + entity)
+        .buildSilently();
+  }
+
+  /**
+   * Same as {@link #requestFailed(RESTException, String, Object, UnaryOperator)}, except that a
+   * request the catalog rejects as invalid (HTTP 400 or 422) is an unsupported operation error
+   * instead of a validation error. For drops: {@code DROP TABLE IF EXISTS} reports any validation
+   * error as "not found" ({@code DropTableHandler}), which would hide that the catalog refused to
+   * drop an existing table.
+   */
+  static UserException dropFailed(
+      RESTException e, String action, Object entity, UnaryOperator<String> redactor) {
+    if (isRejectedRequest(e)) {
+      return rejectedRequest(
+          UserException.unsupportedError(redactedCause(e, redactor)), e, action, entity, redactor);
+    }
+    return requestFailed(e, action, entity, redactor);
+  }
+
+  /** Same as {@link #dropFailed(RESTException, String, Object, UnaryOperator)}, no redaction. */
+  @VisibleForTesting
+  static UserException dropFailed(RESTException e, String action, Object entity) {
+    return dropFailed(e, action, entity, UnaryOperator.identity());
+  }
+
+  private static boolean isRejectedRequest(RESTException e) {
+    return e instanceof BadRequestException || e instanceof UnprocessableEntityException;
+  }
+
+  private static UserException rejectedRequest(
+      UserException.Builder builder,
+      RESTException e,
+      String action,
+      Object entity,
+      UnaryOperator<String> redactor) {
+    return builder
+        .message(
+            "The Iceberg REST catalog rejected the request to %s %s as invalid (HTTP %d): %s",
+            action,
+            entity,
+            e instanceof BadRequestException ? 400 : 422,
+            asSentence(redactedServerMessage(e, redactor)))
+        .addContext("Action", action + " " + entity)
+        .buildSilently();
+  }
+
   /**
    * The server-provided message of {@code e}, redacted and abbreviated to one line. Redacted before
    * abbreviating (so that a cut cannot leave part of a secret behind) and after.
    */
-  static String redactedServerMessage(RuntimeException e, UnaryOperator<String> redactor) {
-    return redactor.apply(abbreviateDetail(redactor.apply(serverMessage(e))));
+  static String redactedServerMessage(Throwable e, UnaryOperator<String> redactor) {
+    String detail = redactor.apply(abbreviateDetail(redactor.apply(serverMessage(e))));
+    // e.g. a message made of HTML markup only
+    return detail.isEmpty() ? e.getClass().getSimpleName() : detail;
+  }
+
+  /**
+   * The exception to pass to a log statement that prints its stack trace: {@code e} itself when no
+   * message in its cause chain contains a secret value, otherwise an exception with the redacted
+   * message of {@code e} (prefixed with its class name) and its stack trace, without the causes.
+   */
+  static Throwable redactedForLogging(Throwable e, UnaryOperator<String> redactor) {
+    boolean containsSecret = false;
+    Throwable t = e;
+    for (int depth = 0; t != null && depth < 20 && !containsSecret; depth++) {
+      String message = t.getMessage();
+      containsSecret = message != null && !message.equals(redactor.apply(message));
+      t = t.getCause();
+    }
+    if (!containsSecret) {
+      return e;
+    }
+    String message = e.getMessage();
+    RuntimeException copy =
+        new RuntimeException(
+            e.getClass().getName() + ": " + (message == null ? "" : redactor.apply(message)));
+    copy.setStackTrace(e.getStackTrace());
+    return copy;
   }
 
   /**
@@ -157,12 +329,46 @@ final class RestCatalogExceptionMapper {
     if (Objects.equals(message, redacted)) {
       return e;
     }
-    RuntimeException copy =
-        e instanceof NotAuthorizedException
-            ? new NotAuthorizedException("%s", redacted)
-            : new ForbiddenException("%s", redacted);
+    RuntimeException copy;
+    if (e instanceof NotAuthorizedException) {
+      copy = new NotAuthorizedException("%s", redacted);
+    } else if (e instanceof ForbiddenException) {
+      copy = new ForbiddenException("%s", redacted);
+    } else if (e instanceof ServiceFailureException) {
+      copy = new ServiceFailureException(e.getCause(), "%s", redacted);
+    } else if (e instanceof ServiceUnavailableException) {
+      copy = new ServiceUnavailableException(e.getCause(), "%s", redacted);
+    } else {
+      copy = new RESTException(e.getCause(), "%s", redacted);
+    }
     copy.setStackTrace(e.getStackTrace());
     return copy;
+  }
+
+  @Nullable
+  private static Throwable findNetworkCause(Throwable failure) {
+    Throwable t = failure;
+    for (int depth = 0; t != null && depth < 20; depth++) {
+      if (t instanceof ConnectException
+          || t instanceof UnknownHostException
+          || t instanceof NoRouteToHostException) {
+        return t;
+      }
+      t = t.getCause();
+    }
+    return null;
+  }
+
+  @Nullable
+  private static <T extends Throwable> T findCause(Throwable failure, Class<T> type) {
+    Throwable t = failure;
+    for (int depth = 0; t != null && depth < 20; depth++) {
+      if (type.isInstance(t)) {
+        return type.cast(t);
+      }
+      t = t.getCause();
+    }
+    return null;
   }
 
   /** Returns true when the REST catalog reports that a namespace is not empty with an HTTP 400. */
@@ -234,7 +440,7 @@ final class RestCatalogExceptionMapper {
     return last == '.' || last == '!' || last == '?' ? message : message + ".";
   }
 
-  private static String serverMessage(RuntimeException e) {
+  private static String serverMessage(Throwable e) {
     String message = e.getMessage();
     return message == null || message.isBlank() ? e.getClass().getSimpleName() : message.trim();
   }

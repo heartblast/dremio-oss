@@ -54,12 +54,18 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.TreeSet;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.CatalogUtil;
@@ -68,6 +74,7 @@ import org.apache.iceberg.exceptions.ForbiddenException;
 import org.apache.iceberg.exceptions.NotAuthorizedException;
 import org.apache.iceberg.exceptions.RESTException;
 import org.apache.iceberg.rest.RESTCatalog;
+import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 import org.mockito.ArgumentCaptor;
@@ -748,6 +755,44 @@ public class TestRestIcebergCatalogPluginConfig extends BaseTestQuery {
     }
   }
 
+  /**
+   * The UI blocks secret keys in the plain property list with its own copy of the rule ({@code
+   * isSensitivePropertyKey} in {@code dac/ui/src/utils/sourceUtils.ts}). Fails when the two copies
+   * drift apart. Skipped when the UI sources are not available (e.g. a partial checkout).
+   */
+  @Test
+  public void testSensitiveKeyRuleIsInSyncWithUi() throws IOException {
+    Path sourceUtils = Paths.get("..", "..", "dac", "ui", "src", "utils", "sourceUtils.ts");
+    Assume.assumeTrue(
+        "UI sources not available: " + sourceUtils.toAbsolutePath(),
+        Files.isRegularFile(sourceUtils));
+    String ts = new String(Files.readAllBytes(sourceUtils), StandardCharsets.UTF_8);
+
+    assertEquals(
+        new TreeSet<>(RestIcebergCatalogPlugin.SENSITIVE_PROPERTY_KEYS),
+        new TreeSet<>(tsStringArray(ts, "SENSITIVE_PROPERTY_KEYS")));
+    assertEquals(
+        RestIcebergCatalogPlugin.SENSITIVE_KEY_SUBSTRINGS,
+        tsStringArray(ts, "SENSITIVE_KEY_SUBSTRINGS"));
+    assertEquals(
+        RestIcebergCatalogPlugin.SENSITIVE_KEY_SUFFIXES,
+        tsStringArray(ts, "SENSITIVE_KEY_SUFFIXES"));
+  }
+
+  /** The string elements of {@code const <name> = [...]} in TypeScript source. */
+  private static List<String> tsStringArray(String ts, String name) {
+    Matcher array =
+        Pattern.compile("const " + name + "\\s*=\\s*\\[(.*?)\\]", Pattern.DOTALL).matcher(ts);
+    assertTrue("array " + name + " not found in sourceUtils.ts", array.find());
+    Matcher element = Pattern.compile("\"([^\"]*)\"").matcher(array.group(1));
+    List<String> values = new ArrayList<>();
+    while (element.find()) {
+      values.add(element.group(1));
+    }
+    assertFalse("array " + name + " is empty", values.isEmpty());
+    return values;
+  }
+
   @Test
   public void testSensitiveKeyInPropertyListLogsWarningWithKeyNameOnly() throws Exception {
     RestIcebergCatalogPluginConfig conf = new RestIcebergCatalogPluginConfig();
@@ -965,19 +1010,19 @@ public class TestRestIcebergCatalogPluginConfig extends BaseTestQuery {
   public void testRedactSecretsIgnoresShortValuesAndMatchesMediumValuesAsWholeTokens() {
     RestIcebergCatalogPluginConfig conf = new RestIcebergCatalogPluginConfig();
     conf.restEndpointUri = "http://localhost:8181/api/catalog";
-    conf.propertyList = new ArrayList<>(Arrays.asList(new Property("warehouse", "dremiodev")));
+    conf.propertyList = new ArrayList<>(Arrays.asList(new Property("warehouse", "bucketabc")));
     conf.secretPropertyList =
         new ArrayList<>(
             Arrays.asList(
                 new Property("credential", "id:1"),
-                new Property("fs.s3a.access.key", "dev"),
+                new Property("fs.s3a.access.key", "abc"),
                 new Property("token", "abcd")));
     RestIcebergCatalogPlugin plugin = newPlugin(conf);
 
-    // "1" and "dev" are too short to redact; "id:1" and "abcd" only as whole tokens.
+    // "1" and "abc" are too short to redact; "id:1" and "abcd" only as whole tokens.
     assertEquals(
-        "HTTP 401 for dremiodev, token ****, xabcdx, credential ****",
-        plugin.redactSecrets("HTTP 401 for dremiodev, token abcd, xabcdx, credential id:1"));
+        "HTTP 401 for bucketabc, token ****, xabcdx, credential ****",
+        plugin.redactSecrets("HTTP 401 for bucketabc, token abcd, xabcdx, credential id:1"));
   }
 
   @Test

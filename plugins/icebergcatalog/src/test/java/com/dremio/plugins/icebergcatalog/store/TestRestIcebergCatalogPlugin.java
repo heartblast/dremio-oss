@@ -20,6 +20,7 @@ import static com.dremio.exec.catalog.CatalogOptions.RESTCATALOG_FOLDERS_SUPPORT
 import static com.dremio.exec.catalog.CatalogOptions.RESTCATALOG_VIEWS_SUPPORTED;
 import static com.dremio.exec.store.IcebergCatalogPluginOptions.RESTCATALOG_PLUGIN_ENABLED;
 import static com.dremio.exec.store.IcebergCatalogPluginOptions.RESTCATALOG_PLUGIN_MUTABLE_ENABLED;
+import static com.dremio.service.users.SystemUser.SYSTEM_USERNAME;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
@@ -69,12 +70,14 @@ import com.dremio.options.OptionManager;
 import com.dremio.plugins.icebergcatalog.dfs.DatasetFileSystemCache;
 import com.dremio.sabot.exec.context.OperatorContext;
 import com.dremio.service.namespace.NamespaceKey;
+import com.dremio.service.namespace.NamespaceService;
 import com.dremio.service.namespace.dataset.proto.DatasetConfig;
 import com.dremio.service.namespace.dataset.proto.DatasetType;
 import com.dremio.service.namespace.dataset.proto.IcebergMetadata;
 import com.dremio.service.namespace.dataset.proto.IcebergViewAttributes;
 import com.dremio.service.namespace.dataset.proto.PhysicalDataset;
 import com.dremio.service.namespace.dataset.proto.VirtualDataset;
+import com.dremio.service.namespace.proto.NameSpaceContainer;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -619,6 +622,42 @@ public class TestRestIcebergCatalogPlugin extends BaseTestQuery {
     assertThatThrownBy(() -> plugin.dropTable(namespaceKey, null, null))
         .isInstanceOf(CatalogEntityNotFoundException.class)
         .hasMessageContaining("not found");
+  }
+
+  @Test
+  public void testDropMissingTableUnknownToDremioIsNotFound() {
+    when(optionManager.getOption(RESTCATALOG_PLUGIN_MUTABLE_ENABLED)).thenReturn(true);
+    NamespaceKey key = new NamespaceKey(Arrays.asList("resticebergcatalog", "ns1", "gone"));
+    NamespaceService namespaceService = mock(NamespaceService.class);
+    when(pluginSabotContext.getNamespaceService(SYSTEM_USERNAME)).thenReturn(namespaceService);
+    when(namespaceService.exists(key, NameSpaceContainer.Type.DATASET)).thenReturn(false);
+    doThrow(new NoSuchTableException("Table does not exist: ns1.gone"))
+        .when(mockCatalogAccessor)
+        .dropTable(key.getPathComponents());
+
+    // CatalogImpl turns it into a validation error: DROP TABLE IF EXISTS then reports "not found"
+    // instead of "dropped".
+    assertThatThrownBy(() -> plugin.dropTable(key, null, null))
+        .isInstanceOf(CatalogEntityNotFoundException.class)
+        .hasMessage("Table [resticebergcatalog.ns1.gone] not found");
+  }
+
+  @Test
+  public void testDropTableDroppedOutsideDremioRemovesDremiosEntry() throws Exception {
+    when(optionManager.getOption(RESTCATALOG_PLUGIN_MUTABLE_ENABLED)).thenReturn(true);
+    NamespaceKey key = new NamespaceKey(Arrays.asList("resticebergcatalog", "ns1", "stale"));
+    NamespaceService namespaceService = mock(NamespaceService.class);
+    when(pluginSabotContext.getNamespaceService(SYSTEM_USERNAME)).thenReturn(namespaceService);
+    when(namespaceService.exists(key, NameSpaceContainer.Type.DATASET)).thenReturn(true);
+    doThrow(new NoSuchTableException("Table does not exist: ns1.stale"))
+        .when(mockCatalogAccessor)
+        .dropTable(key.getPathComponents());
+
+    // Dremio still lists the table (until the next names refresh): the drop succeeds so that
+    // CatalogImpl deletes that entry.
+    plugin.dropTable(key, null, null);
+
+    verify(mockCatalogAccessor).dropTable(key.getPathComponents());
   }
 
   @Test

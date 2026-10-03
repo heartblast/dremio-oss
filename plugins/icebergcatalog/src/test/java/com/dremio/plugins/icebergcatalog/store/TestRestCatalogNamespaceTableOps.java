@@ -37,11 +37,15 @@ import com.dremio.common.exceptions.UserException;
 import com.dremio.exec.proto.UserBitShared.DremioPBError.ErrorType;
 import com.dremio.exec.store.iceberg.DremioFileIO;
 import com.dremio.options.OptionManager;
+import java.io.IOException;
+import java.net.ConnectException;
+import java.net.SocketTimeoutException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
+import javax.net.ssl.SSLHandshakeException;
 import org.apache.iceberg.BaseTransaction;
 import org.apache.iceberg.MetadataUpdate;
 import org.apache.iceberg.PartitionSpec;
@@ -63,6 +67,10 @@ import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.exceptions.NoSuchViewException;
 import org.apache.iceberg.exceptions.NotAuthorizedException;
+import org.apache.iceberg.exceptions.RESTException;
+import org.apache.iceberg.exceptions.ServiceFailureException;
+import org.apache.iceberg.exceptions.ServiceUnavailableException;
+import org.apache.iceberg.exceptions.UnprocessableEntityException;
 import org.apache.iceberg.rest.RESTCatalog;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.view.ViewBuilder;
@@ -159,11 +167,18 @@ public class TestRestCatalogNamespaceTableOps {
   }
 
   @Test
-  public void testDropFolderOtherBadRequestIsRethrown() {
-    BadRequestException original = new BadRequestException("Malformed request: something else");
-    when(catalog.dropNamespace(Namespace.of("ns1"))).thenThrow(original);
+  public void testDropFolderOtherBadRequestIsValidationError() {
+    when(catalog.dropNamespace(Namespace.of("ns1")))
+        .thenThrow(new BadRequestException("Malformed request: something else"));
 
-    assertThatThrownBy(() -> accessor.dropFolder(path("ns1"))).isSameAs(original);
+    assertThatThrownBy(() -> accessor.dropFolder(path("ns1")))
+        .satisfies(
+            t ->
+                assertUserException(
+                    t,
+                    ErrorType.VALIDATION,
+                    "rejected the request to drop folder [ns1] as invalid (HTTP 400)",
+                    "something else"));
   }
 
   @Test
@@ -442,6 +457,331 @@ public class TestRestCatalogNamespaceTableOps {
   }
 
   @Test
+  public void testDropTableReturningFalseIsNotFound() {
+    // RESTSessionCatalog#dropTable returns false on HTTP 404.
+    when(catalog.dropTable(TableIdentifier.of("ns1", "gone"), false)).thenReturn(false);
+
+    assertThatThrownBy(() -> accessor.dropTable(path("ns1", "gone")))
+        .isInstanceOf(NoSuchTableException.class)
+        .hasMessageContaining("ns1.gone");
+  }
+
+  @Test
+  public void testDropTableInMissingNamespaceIsNotFound() {
+    when(catalog.dropTable(TableIdentifier.of("nsx", "t1"), false))
+        .thenThrow(new NoSuchNamespaceException("Namespace does not exist: nsx"));
+
+    assertThatThrownBy(() -> accessor.dropTable(path("nsx", "t1")))
+        .isInstanceOf(NoSuchTableException.class);
+  }
+
+  @Test
+  public void testDropTableServerErrorIsConnectionError() {
+    when(catalog.dropTable(TableIdentifier.of("ns1", "t1"), false))
+        .thenThrow(new ServiceFailureException("Server error: %s", "boom"));
+
+    assertThatThrownBy(() -> accessor.dropTable(path("ns1", "t1")))
+        .satisfies(
+            t ->
+                assertUserException(
+                    t, ErrorType.CONNECTION, "(HTTP 500) for the request to drop table [ns1.t1]"));
+  }
+
+  @Test
+  public void testDropTableRejectedRequestIsNotValidationError() {
+    // DROP TABLE IF EXISTS reports a validation error as "not found": a drop that the catalog
+    // rejects (HTTP 400/422) must not look like a missing table while the table still exists.
+    when(catalog.dropTable(TableIdentifier.of("ns1", "t1"), false))
+        .thenThrow(new BadRequestException("Malformed request: %s", "cannot drop"));
+    when(catalog.dropTable(TableIdentifier.of("ns1", "t2"), false))
+        .thenThrow(new UnprocessableEntityException("Unprocessable: %s", "cannot drop"));
+
+    assertThatThrownBy(() -> accessor.dropTable(path("ns1", "t1")))
+        .satisfies(
+            t ->
+                assertUserException(
+                    t,
+                    ErrorType.UNSUPPORTED_OPERATION,
+                    "rejected the request to drop table [ns1.t1] as invalid (HTTP 400)",
+                    "cannot drop"));
+    assertThatThrownBy(() -> accessor.dropTable(path("ns1", "t2")))
+        .satisfies(
+            t ->
+                assertUserException(
+                    t,
+                    ErrorType.UNSUPPORTED_OPERATION,
+                    "rejected the request to drop table [ns1.t2] as invalid (HTTP 422)"));
+  }
+
+  @Test
+  public void testRequestFailuresOnWriteOperationsAreMapped() {
+    ServiceFailureException failure = new ServiceFailureException("Server error: %s", "boom");
+    when(mockTableBuilder(TableIdentifier.of("ns1", "t1")).create()).thenThrow(failure);
+    doThrow(failure).when(catalog).createNamespace(eq(Namespace.of("ns2")), anyMap());
+    when(catalog.dropNamespace(Namespace.of("ns3"))).thenThrow(failure);
+    when(catalog.dropView(TableIdentifier.of("ns1", "v1"))).thenThrow(failure);
+    when(catalog.viewExists(TableIdentifier.of("ns1", "v2"))).thenThrow(failure);
+    when(catalog.newCreateTableTransaction(TableIdentifier.of("ns1", "c1"), SCHEMA))
+        .thenThrow(failure);
+
+    assertThatThrownBy(() -> createTable("ns1", "t1"))
+        .satisfies(t -> assertServerError(t, "create table [ns1.t1]"));
+    assertThatThrownBy(() -> accessor.createFolder(path("ns2"), Collections.emptyMap()))
+        .satisfies(t -> assertServerError(t, "create folder [ns2]"));
+    assertThatThrownBy(() -> accessor.dropFolder(path("ns3")))
+        .satisfies(t -> assertServerError(t, "drop folder [ns3]"));
+    assertThatThrownBy(() -> accessor.dropView(path("ns1", "v1")))
+        .satisfies(t -> assertServerError(t, "drop view [ns1.v1]"));
+    assertThatThrownBy(
+            () ->
+                accessor.createView(
+                    path("ns1", "v2"), "s3://b/ns1/v2", List.of(SOURCE), SCHEMA, "SELECT 1"))
+        .satisfies(t -> assertServerError(t, "create view [ns1.v2]"));
+    assertThatThrownBy(
+            () ->
+                accessor.updateView(
+                    path("ns1", "v2"), "s3://b/ns1/v2", List.of(SOURCE), SCHEMA, "SELECT 1"))
+        .satisfies(t -> assertServerError(t, "replace view [ns1.v2]"));
+    assertThatThrownBy(
+            () ->
+                accessor.createIcebergTableOperationsForCtas(
+                    mock(DremioFileIO.class), path("ns1", "c1"), SCHEMA, null, null))
+        .satisfies(t -> assertServerError(t, "create table [ns1.c1]"));
+  }
+
+  private static void assertServerError(Throwable t, String actionAndEntity) {
+    assertUserException(
+        t,
+        ErrorType.CONNECTION,
+        "(HTTP 500) for the request to " + actionAndEntity,
+        "boom",
+        RestCatalogExceptionMapper.RETRY_HINT);
+  }
+
+  @Test
+  public void testCreateTableBadRequestIsValidationError() {
+    when(mockTableBuilder(TableIdentifier.of("ns1", "t1")).create())
+        .thenThrow(new BadRequestException("Malformed request: %s", "bad location"));
+
+    assertThatThrownBy(() -> createTable("ns1", "t1"))
+        .satisfies(
+            t ->
+                assertUserException(
+                    t,
+                    ErrorType.VALIDATION,
+                    "rejected the request to create table [ns1.t1] as invalid (HTTP 400)",
+                    "bad location"));
+  }
+
+  @Test
+  public void testLoadTableUnclassifiedHttpErrorIsConnectionErrorWithHint() {
+    // HTTP 429 (and 502, 504, ...): the Iceberg REST client throws a plain RESTException.
+    when(optionManager.getOption(RESTCATALOG_PLUGIN_TABLE_CACHE_ENABLED)).thenReturn(false);
+    when(catalog.loadTable(TableIdentifier.of("ns1", "t1")))
+        .thenThrow(new RESTException("Unable to process: %s", "rate limited"));
+
+    assertThatThrownBy(() -> accessor.loadTable(TableIdentifier.of("ns1", "t1")))
+        .satisfies(
+            t ->
+                assertUserException(
+                    t,
+                    ErrorType.CONNECTION,
+                    "unexpected HTTP error for the request to load table [ns1.t1]",
+                    "Unable to process: rate limited.",
+                    RestCatalogExceptionMapper.UNCLASSIFIED_STATUS_NOTE))
+        .hasCauseInstanceOf(RESTException.class);
+  }
+
+  @Test
+  public void testLoadTableThroughCacheTimeoutIsConnectionErrorWithHint() {
+    when(optionManager.getOption(RESTCATALOG_PLUGIN_TABLE_CACHE_ENABLED)).thenReturn(true);
+    when(catalog.loadTable(TableIdentifier.of("ns1", "t1")))
+        .thenThrow(
+            new RESTException(
+                new SocketTimeoutException("Read timed out"),
+                "Error occurred while processing %s request",
+                "GET"));
+
+    assertThatThrownBy(() -> accessor.loadTable(TableIdentifier.of("ns1", "t1")))
+        .satisfies(
+            t ->
+                assertUserException(
+                    t,
+                    ErrorType.CONNECTION,
+                    "did not respond in time to the request to load table [ns1.t1]",
+                    "(Read timed out)",
+                    RestCatalogExceptionMapper.TIMEOUT_HINT));
+  }
+
+  @Test
+  public void testLoadTableServiceUnavailableMentionsRetries() {
+    when(optionManager.getOption(RESTCATALOG_PLUGIN_TABLE_CACHE_ENABLED)).thenReturn(false);
+    when(catalog.loadTable(TableIdentifier.of("ns1", "t1")))
+        .thenThrow(new ServiceUnavailableException("Service unavailable: %s", "down"));
+
+    assertThatThrownBy(() -> accessor.loadTable(TableIdentifier.of("ns1", "t1")))
+        .satisfies(
+            t ->
+                assertUserException(
+                    t,
+                    ErrorType.CONNECTION,
+                    "unavailable (HTTP 503)",
+                    RestCatalogExceptionMapper.RETRIED_NOTE));
+  }
+
+  @Test
+  public void testLoadViewServerErrorIsConnectionError() {
+    when(optionManager.getOption(RESTCATALOG_PLUGIN_VIEW_CACHE_ENABLED)).thenReturn(false);
+    when(catalog.loadView(TableIdentifier.of("ns1", "v1")))
+        .thenThrow(new ServiceFailureException("Server error: %s", "boom"));
+
+    assertThatThrownBy(() -> accessor.loadView(TableIdentifier.of("ns1", "v1")))
+        .satisfies(t -> assertUserException(t, ErrorType.CONNECTION, "load view [ns1.v1]"));
+  }
+
+  @Test
+  public void testRequestFailedRedactsServerTextAndCause() {
+    RESTException e = new RESTException("Unable to process: %s", "echo s3cr3t-value");
+    UserException mapped =
+        RestCatalogExceptionMapper.requestFailed(
+            e, "look up", "[ns1.t1]", text -> text.replace("s3cr3t-value", "****"));
+
+    assertThat(mapped.getOriginalMessage()).contains("echo ****").doesNotContain("s3cr3t");
+    assertThat(mapped.getCause()).isInstanceOf(RESTException.class);
+    assertThat(mapped.getCause().getMessage()).doesNotContain("s3cr3t");
+    assertThat(mapped.getCause().getStackTrace()).isEqualTo(e.getStackTrace());
+  }
+
+  @Test
+  public void testRequestFailedClassifiesNetworkFailures() {
+    assertThat(
+            RestCatalogExceptionMapper.requestFailed(
+                    new RESTException(new ConnectException("Connection refused"), "Error occurred"),
+                    "look up",
+                    "[t]")
+                .getOriginalMessage())
+        .contains("Unable to reach")
+        .contains(RestCatalogExceptionMapper.UNREACHABLE_HINT);
+    assertThat(
+            RestCatalogExceptionMapper.requestFailed(
+                    new RESTException(new SSLHandshakeException("bad cert"), "Error occurred"),
+                    "look up",
+                    "[t]")
+                .getOriginalMessage())
+        .contains("TLS connection")
+        .contains(RestCatalogExceptionMapper.TLS_HINT);
+    assertThat(
+            RestCatalogExceptionMapper.requestFailed(
+                    new RESTException(new IOException("Connection reset"), "Error occurred"),
+                    "look up",
+                    "[t]")
+                .getOriginalMessage())
+        .contains("connection to the Iceberg REST catalog failed")
+        .contains("(Connection reset)")
+        .contains(RestCatalogExceptionMapper.CONNECTION_RETRIED_NOTE);
+  }
+
+  @Test
+  public void testNotAuthorizedOnWriteOperationsIsPermissionError() {
+    NotAuthorizedException expired = new NotAuthorizedException("Not authorized: %s", "expired");
+    when(mockTableBuilder(TableIdentifier.of("ns1", "t1")).create()).thenThrow(expired);
+    doThrow(expired).when(catalog).createNamespace(eq(Namespace.of("ns2")), anyMap());
+    when(catalog.dropNamespace(Namespace.of("ns3"))).thenThrow(expired);
+    when(catalog.dropView(TableIdentifier.of("ns1", "v1"))).thenThrow(expired);
+    // The existence check before creating or replacing a view is mapped too.
+    when(catalog.viewExists(TableIdentifier.of("ns1", "v2"))).thenThrow(expired);
+    when(catalog.newCreateTableTransaction(TableIdentifier.of("ns1", "c1"), SCHEMA))
+        .thenThrow(expired);
+
+    assertThatThrownBy(() -> createTable("ns1", "t1"))
+        .satisfies(t -> assertNotAuthorized(t, "create table [ns1.t1]"));
+    assertThatThrownBy(() -> accessor.createFolder(path("ns2"), Collections.emptyMap()))
+        .satisfies(t -> assertNotAuthorized(t, "create folder [ns2]"));
+    assertThatThrownBy(() -> accessor.dropFolder(path("ns3")))
+        .satisfies(t -> assertNotAuthorized(t, "drop folder [ns3]"));
+    assertThatThrownBy(() -> accessor.dropView(path("ns1", "v1")))
+        .satisfies(t -> assertNotAuthorized(t, "drop view [ns1.v1]"));
+    assertThatThrownBy(
+            () ->
+                accessor.createView(
+                    path("ns1", "v2"), "s3://b/ns1/v2", List.of(SOURCE), SCHEMA, "SELECT 1"))
+        .satisfies(t -> assertNotAuthorized(t, "create view [ns1.v2]"));
+    assertThatThrownBy(
+            () ->
+                accessor.updateView(
+                    path("ns1", "v2"), "s3://b/ns1/v2", List.of(SOURCE), SCHEMA, "SELECT 1"))
+        .satisfies(t -> assertNotAuthorized(t, "replace view [ns1.v2]"));
+    assertThatThrownBy(
+            () ->
+                accessor.createIcebergTableOperationsForCtas(
+                    mock(DremioFileIO.class), path("ns1", "c1"), SCHEMA, null, null))
+        .satisfies(t -> assertNotAuthorized(t, "create table [ns1.c1]"));
+  }
+
+  private static void assertNotAuthorized(Throwable t, String actionAndEntity) {
+    assertUserException(
+        t,
+        ErrorType.PERMISSION,
+        "rejected the credentials of the request to " + actionAndEntity,
+        RestCatalogExceptionMapper.NOT_AUTHORIZED_HINT);
+  }
+
+  @Test
+  public void testLoadTableBadRequestIsValidationError() {
+    // BadRequestException (HTTP 400) is a RESTException too, but not a connection problem.
+    when(optionManager.getOption(RESTCATALOG_PLUGIN_TABLE_CACHE_ENABLED)).thenReturn(false);
+    when(catalog.loadTable(TableIdentifier.of("ns1", "t1")))
+        .thenThrow(new BadRequestException("Malformed request: %s", "bad identifier"));
+
+    assertThatThrownBy(() -> accessor.loadTable(TableIdentifier.of("ns1", "t1")))
+        .satisfies(
+            t ->
+                assertUserException(
+                    t,
+                    ErrorType.VALIDATION,
+                    "rejected the request to load table [ns1.t1] as invalid (HTTP 400)",
+                    "Malformed request: bad identifier."));
+    assertThat(
+            RestCatalogExceptionMapper.requestFailed(
+                    new UnprocessableEntityException("Unable to process: %s", "bad"),
+                    "look up",
+                    "[t]")
+                .getErrorType())
+        .isEqualTo(ErrorType.VALIDATION);
+  }
+
+  @Test
+  public void testRequestFailedWithMarkupOnlyMessageNamesTheExceptionType() {
+    UserException mapped =
+        RestCatalogExceptionMapper.requestFailed(
+            new RESTException("%s", "<html><body><hr></body></html>"), "look up", "[t]");
+
+    assertThat(mapped.getOriginalMessage())
+        .contains("unexpected HTTP error for the request to look up [t]: RESTException.");
+  }
+
+  @Test
+  public void testRedactedForLoggingDropsSecretsFromTheCauseChain() {
+    UnaryOperator<String> redactor = text -> text.replace("s3cr3t-value", "****");
+    RESTException clean = new RESTException("Unable to process: %s", "boom");
+    assertThat(RestCatalogExceptionMapper.redactedForLogging(clean, redactor)).isSameAs(clean);
+
+    RESTException leaky =
+        new RESTException(
+            new IOException("echo s3cr3t-value"), "Unable to process: %s", "echo s3cr3t-value");
+    Throwable logged = RestCatalogExceptionMapper.redactedForLogging(leaky, redactor);
+    assertThat(logged.getMessage())
+        .isEqualTo(RESTException.class.getName() + ": Unable to process: echo ****");
+    assertThat(logged.getCause()).isNull();
+    assertThat(logged.getStackTrace()).isEqualTo(leaky.getStackTrace());
+
+    RESTException leakyCause =
+        new RESTException(new IOException("echo s3cr3t-value"), "Unable to process");
+    assertThat(RestCatalogExceptionMapper.redactedForLogging(leakyCause, redactor).getCause())
+        .isNull();
+  }
+
+  @Test
   public void testLoadTableForbiddenIsPermissionError() {
     when(optionManager.getOption(RESTCATALOG_PLUGIN_TABLE_CACHE_ENABLED)).thenReturn(false);
     when(catalog.loadTable(TableIdentifier.of("ns1", "t1")))
@@ -512,6 +852,28 @@ public class TestRestCatalogNamespaceTableOps {
                   ErrorType.PERMISSION,
                   "UPDATE_TABLE");
             });
+  }
+
+  @Test
+  public void testCommitNotAuthorizedIsPermissionError() throws Exception {
+    TableOperations delegate = mockRestTableOperations();
+    TableMetadata base = mock(TableMetadata.class);
+    TableMetadata updated = mock(TableMetadata.class);
+    doThrow(new NotAuthorizedException("Not authorized: %s", "expired"))
+        .when(delegate)
+        .commit(base, updated);
+    TableOperations ops =
+        new AbstractRestCatalogAccessor.ForbiddenMappingTableOperations(
+            mock(DremioFileIO.class), delegate, path("ns1", "t1"), UnaryOperator.identity());
+
+    assertThatThrownBy(() -> ops.commit(base, updated))
+        .isInstanceOf(AbstractRestCatalogAccessor.CommitNotAuthorizedException.class)
+        .isInstanceOf(CleanableFailure.class)
+        .satisfies(
+            t ->
+                assertNotAuthorized(
+                    UserException.systemError(t).buildSilently(),
+                    "commit to table [polaris.ns1.t1]"));
   }
 
   @Test

@@ -20,7 +20,6 @@ import static com.dremio.exec.store.IcebergCatalogPluginOptions.RESTCATALOG_PLUG
 import com.dremio.options.OptionManager;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
-import java.io.Closeable;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -142,7 +141,7 @@ public class IcebergRestCatalogAccessor extends AbstractRestCatalogAccessor {
       replaceCachedClient(fresh);
       throw e;
     } catch (RuntimeException e) {
-      closeQuietly(fresh);
+      ExpiringCatalogCache.closeQuietly(fresh);
       throw e;
     }
     replaceCachedClient(fresh);
@@ -173,16 +172,6 @@ public class IcebergRestCatalogAccessor extends AbstractRestCatalogAccessor {
     // A denied root listing says nothing about the cached tables and views. With allowed
     // namespaces the source reports it as healthy, and it then occurs on every state check.
     return !(failure instanceof NamespaceListingForbiddenException);
-  }
-
-  private static void closeQuietly(Catalog catalog) {
-    if (catalog instanceof Closeable) {
-      try {
-        ((Closeable) catalog).close();
-      } catch (Exception e) {
-        logger.debug("Failed to close an Iceberg REST catalog client.", e);
-      }
-    }
   }
 
   @Override

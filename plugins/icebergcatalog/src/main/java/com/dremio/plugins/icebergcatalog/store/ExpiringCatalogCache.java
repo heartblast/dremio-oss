@@ -57,11 +57,14 @@ public class ExpiringCatalogCache implements Supplier<Catalog>, Closeable {
     }
   }
 
-  private static void closeQuietly(Catalog toClose) {
-    try {
-      ((Closeable) toClose).close();
-    } catch (Exception e) {
-      logger.warn("Encountered exception during closing the catalog.");
+  /** Closes a catalog client that is no longer used; a failure only matters for debugging. */
+  static void closeQuietly(Catalog toClose) {
+    if (toClose instanceof Closeable) {
+      try {
+        ((Closeable) toClose).close();
+      } catch (Exception e) {
+        logger.debug("Failed to close an Iceberg REST catalog client.", e);
+      }
     }
   }
 

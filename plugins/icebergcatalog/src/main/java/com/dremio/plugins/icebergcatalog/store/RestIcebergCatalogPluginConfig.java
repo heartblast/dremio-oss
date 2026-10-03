@@ -45,22 +45,21 @@ public class RestIcebergCatalogPluginConfig extends IcebergCatalogPluginConfig {
   @DisplayMetadata(label = "Endpoint URI")
   public String restEndpointUri;
 
+  /**
+   * List of allowed namespaces. Set to null by default to indicate that all namespaces are visible
+   * Uses {@code com.dremio.exec.store.IcebergCatalogPluginOptions.RESTCATALOG_ALLOWED_NS_SEPARATOR}
+   * as NS separator regex sequence, by default "\\."
+   */
   @Tag(11)
   @DisplayMetadata(label = "Allowed Namespaces")
-  /**
-   * List of allowed namespaces. Set to null by default to indicate that all namespaces are visible
-   * Uses {@code com.dremio.exec.store.IcebergCatalogPluginOptions.RESTCATALOG_ALLOWED_NS_SEPARATOR}
-   * as NS separator regex sequence, by default "\\."
-   */
   public List<String> allowedNamespaces;
 
+  /**
+   * When true (the default), the namespaces below each allowed namespace are discovered as well.
+   * When false, only the tables and views directly in the allowed namespaces are listed.
+   */
   @Tag(12)
   @DisplayMetadata(label = "Allowed Namespaces include their whole subtrees")
-  /**
-   * List of allowed namespaces. Set to null by default to indicate that all namespaces are visible
-   * Uses {@code com.dremio.exec.store.IcebergCatalogPluginOptions.RESTCATALOG_ALLOWED_NS_SEPARATOR}
-   * as NS separator regex sequence, by default "\\."
-   */
   public boolean isRecursiveAllowedNamespaces = true;
 
   /**

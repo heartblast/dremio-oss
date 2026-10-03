@@ -3,7 +3,7 @@
 - 대상: Dremio OSS(`feature/polaris-restcatalog` build) → Iceberg REST → Apache Polaris OSS `1.1.0-incubating` → S3 / S3-compatible storage(MinIO).
 - 구조와 설계 근거: [design.md](design.md). Storage 상세: [storage.md](storage.md). 보안: [security.md](security.md). 제약: [known-limitations.md](known-limitations.md).
 - 이 문서의 모든 secret과 host는 placeholder다: `<client_id>:<client_secret>`, `<access-key>`, `<secret-key>`, `<polaris-host>`, `<minio-host>`, `<catalog>`, `<dremio-host>`, `<user>`, `<password>`. 실제 값을 문서, script, shell history에 남기지 않는다.
-- 검증 상태: MinIO 경로는 Phase 4 live와 Phase 5 E2E(UI/REST 등록, lifecycle, read, write, view, cache, 장애)에서 PASS ([test-results.md §5](test-results.md#5-phase-5--실제-e2e--regression)). **실제 AWS S3는 계정이 없어 검증하지 못했다 (`ENVIRONMENT_BLOCKED`)**.
+- 검증 상태: MinIO 경로는 Phase 4 live와 Phase 5 E2E(UI/REST 등록, lifecycle, read, write, view, cache, 장애)에서 PASS ([test-results.md §5](test-results.md#5-phase-5--실제-e2e--regression)). Phase 6 release tarball 최종 smoke도 PASS ([test-results.md §7](test-results.md#7-phase-6--최종-통합--release-readiness)). **실제 AWS S3는 계정이 없어 검증하지 못했다 (`ENVIRONMENT_BLOCKED`)**.
 
 ## 0. 필수 값 요약
 
@@ -47,7 +47,7 @@
 
 참고:
 - 위 절차는 Phase 5에서 브라우저(Playwright)로 실행했다: Polaris preset과 generic tile 생성, 필수값/secret key validation, Edit의 masked credential, 변경 없는 Save 후 credential 유지 ([test-results.md §5.8](test-results.md#58-ui-agent-g-instance6), 화면: [img/](img/)). `img/`의 Advanced Options 화면 3장(`ui-polaris-preset-advanced.png`, `ui-edit-source-masked-credentials.png`, `ui-validation-secret-in-properties.png`)은 Phase 5 help text 수정(known-limitations U-09) 전에 찍은 것이다. 그 화면의 Catalog Properties 안내(`(no scheme)`, `fs.s3a.requester.pays.enabled=false`, `dremio.bucket.discovery.enabled=false`, `dremio.s3.region=<region>`)는 따르지 않는다. 현재 안내는 `restcatalog-layout.json`과 §4가 기준이다 (non-default region이면 `fs.s3a.endpoint.region=<region>`).
-- 배포용 tarball에 이 UI(preset, label, validator)가 들어가려면 `dac/ui`를 다시 build해야 한다 (`-Ddremio.no-ui`로 만든 tarball은 이전 UI jar를 쓴다, known-limitations U-02).
+- 배포용 tarball에 이 UI(preset, label, validator)가 들어가려면 `dac/ui`를 Maven으로 다시 install한 뒤(`-Ddremio.no-ui` 없이) `distribution/server`를 build한다. Phase 6 release tarball은 이렇게 만들었고 새 UI가 들어 있다 (known-limitations U-02, [test-results.md §7](test-results.md#7-phase-6--최종-통합--release-readiness)).
 
 ![Add Source의 Lakehouse Catalogs tile](img/ui-add-source-lakehouse.png)
 
@@ -151,7 +151,7 @@ jq '{entityType: "source", id, tag, type, name, config, metadataPolicy}
 ```
 
 - Secret의 key 이름을 바꿀 때는 masked 값이 아니라 새 값을 넣는다.
-- 잘못된 설정으로 update하면 HTTP 400과 hint가 나오고 기존 source는 이전 설정으로 계속 동작한다. 단, update 실패 후 그 source의 background state/metadata refresh가 멈추는 kernel 동작이 있다 ([known-limitations.md](known-limitations.md) K-01). 같은 설정으로 다시 update해도 복구되지 않고, 설정이 바뀌는 update는 일회성 names refresh만 한다. **Dremio 재시작으로 복구된다.** 그동안 table 직접 query와 `ALTER TABLE … REFRESH METADATA`는 동작한다.
+- 잘못된 설정으로 update하면 HTTP 400과 hint가 나오고 기존 source는 이전 설정으로 계속 동작한다. Background state/metadata refresh도 계속 돈다 (Phase 6 kernel 수정 K-01. 이전 build에서는 update 실패 뒤 refresh가 Dremio 재시작 전까지 멈췄다).
 - 잘못된 S3 key로 update해도 state는 `good`이다 (state check는 catalog만 본다). 첫 SELECT/INSERT에서 S3 오류가 나온다.
 - Source 이름은 바꿀 수 없다 (`name` 변경 PUT은 404 "Source name is immutable."). 새 이름으로 만든 뒤 기존 source를 지운다.
 - `plugins.restcatalog.*` Dremio option은 plugin이 다시 시작될 때 읽는다. `config`의 field가 하나라도 바뀐 update는 plugin을 다시 시작한다. `@NotMetadataImpacting` field(`isCachingEnabled`, `maxCacheSpacePct`, `isUsingVendedCredentials`)만 바꾼 update도 마찬가지다. `@NotMetadataImpacting`은 update 뒤 names를 지우고 전체 refresh할지만 정한다. `metadataPolicy`만 바꾼 update와 같은 설정으로 다시 보낸 update는 plugin을 다시 시작하지 않는다 (`ManagedStoragePlugin.replacePlugin`). 그 밖에는 Dremio 재시작 뒤 적용된다. `maxCacheSpacePct`의 C3 cache 한도는 JVM당 한 번 등록되어 Dremio 재시작 뒤 적용된다 (known-limitations N-14, S-14).
@@ -372,10 +372,13 @@ API:
 | CREATE TABLE 재시도 시 "already exists" | 이전 CREATE가 Polaris에는 남고 Dremio 쪽 S3 오류로 실패 | Polaris에서 table drop 후 재시도 |
 | vended source의 explicit `LOCATION` CTAS가 `AmazonS3Exception: Access Denied` | staged create credential은 기본 location만 | `LOCATION` 생략 또는 static key 추가 |
 | `IllegalStateException: Invalid AWSCredentialsProvider provided` | Phase 4 이전 build에서 provider 생략 | provider 명시 또는 Phase 4 이후 build |
-| update 실패 후 새 namespace/table이 계속 안 보임 | kernel: update 실패 시 background refresh 정지 | Dremio 재시작 (K-01) |
+| update 실패 후 새 namespace/table이 계속 안 보임 | Phase 6 이전 build의 kernel 동작 (update 실패 시 background refresh 정지, K-01) | Phase 6 이후 build 사용, 또는 Dremio 재시작 |
 | 외부에서 drop한 table이 목록에 남고 query는 "not found" | names refresh는 dataset을 지우지 않는다 | `ALTER TABLE … REFRESH METADATA` 또는 dataset refresh 대기 (§2.7) |
 | 외부에서 schema를 바꾼 직후 INSERT "Table schema … doesn't match with query schema" | metadata 유효성 검사 주기(기본 60초) 안의 stale metadata | `ALTER TABLE … REFRESH METADATA` |
 | Storage가 죽었을 때 SELECT가 끝나지 않고 cancel도 안 됨 | S3A 기본 재시도 | §8의 `fs.s3a.*` 재시도/timeout 설정 |
-| 429/5xx/timeout 때 query 오류가 "Unable to process …", "Server error …", "Error occurred while processing GET request"뿐 | table lookup 경로는 401/403만 hint로 매핑 (C-08) | source state 메시지와 server.log 확인 |
+| Query 오류 "Unable to reach the Iceberg REST catalog for the request to …" | catalog 중지, endpoint/port 오류, network | endpoint URI와 catalog 상태 확인 |
+| Query 오류 "… did not respond in time to the request to …" | catalog 응답 지연 (`rest.client.socket-timeout-ms`) | catalog 상태 확인, timeout 조정 (§8) |
+| Query 오류 "… reported a server error (HTTP 500)" / "… is unavailable (HTTP 503)" / "… returned an unexpected HTTP error …" | catalog 또는 앞단 proxy 오류. 429/502/503/504는 `rest.client.max-retries`만큼 재시도한 뒤의 결과 (C-07: 429/502/504는 정확한 status를 표기하지 못한다) | catalog/proxy log 확인 후 재시도. Phase 6 이전 build는 "Unable to process …", "Server error …" 같은 raw 메시지였다 (C-08) |
+| `DROP TABLE IF EXISTS`가 "Table [...] not found." | 그 table이 catalog에도 Dremio 목록에도 없다 (정상, Phase 6부터. 이전 build는 "dropped"로 표시, C-17) | — |
 | Dremio 재시작 뒤 source가 "Source is not currently available."만 표시 | 시작 실패의 원인 hint는 server.log에만 (K-12) | server.log의 "Suggested User Action", 설정은 `/api/v3/source/{id}`로 수정 |
 | Polaris principal secret을 회수했는데 source가 계속 동작 | 실행 중 session은 client secret 없이 token을 갱신한다 (X-09) | Polaris grant 회수, source update 또는 Dremio 재시작 |
