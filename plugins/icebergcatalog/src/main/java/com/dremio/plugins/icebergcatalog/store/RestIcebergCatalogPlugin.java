@@ -68,22 +68,33 @@ import com.dremio.options.TypeValidators.BooleanValidator;
 import com.dremio.sabot.exec.context.OperatorContext;
 import com.dremio.service.namespace.NamespaceAttribute;
 import com.dremio.service.namespace.NamespaceKey;
+import com.dremio.service.namespace.SourceState;
 import com.dremio.service.namespace.dataset.proto.DatasetConfig;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import java.io.IOException;
+import java.net.ConnectException;
+import java.net.NoRouteToHostException;
+import java.net.SocketTimeoutException;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Supplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import javax.annotation.Nullable;
@@ -98,22 +109,97 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
+import org.apache.iceberg.exceptions.BadRequestException;
 import org.apache.iceberg.exceptions.ForbiddenException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.exceptions.NoSuchViewException;
+import org.apache.iceberg.exceptions.NotAuthorizedException;
+import org.apache.iceberg.exceptions.RESTException;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.rest.RESTCatalog;
 import org.apache.iceberg.types.Types;
 
 public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
+  private static final org.slf4j.Logger logger =
+      org.slf4j.LoggerFactory.getLogger(RestIcebergCatalogPlugin.class);
+
+  /**
+   * Catalog property that makes the Iceberg REST client send the {@code
+   * X-Iceberg-Access-Delegation} header (Iceberg REST spec) on every request.
+   */
+  public static final String ACCESS_DELEGATION_HEADER_PROPERTY =
+      "header.X-Iceberg-Access-Delegation";
+
+  /** Access delegation mode requested when vended credentials are enabled. */
+  public static final String VENDED_CREDENTIALS_DELEGATION_MODE = "vended-credentials";
+
+  /**
+   * Property keys (lower case) whose values are secrets and therefore belong in the secret property
+   * list, not in the plain property list.
+   */
+  @VisibleForTesting
+  static final Set<String> SENSITIVE_PROPERTY_KEYS =
+      ImmutableSet.of(
+          "credential",
+          "token",
+          "header.authorization",
+          "fs.s3a.access.key",
+          "fs.s3a.secret.key",
+          "fs.s3a.session.token",
+          "s3.access-key-id",
+          "s3.secret-access-key",
+          "s3.session-token");
+
+  /**
+   * Property keys (lower case) that only configure the Iceberg REST client (authentication and
+   * request headers). They are passed to the catalog but never copied into the Hadoop
+   * configuration, so that OAuth2 secrets do not travel with every FileSystem/FileIO configuration.
+   * Keys starting with {@link #REST_CLIENT_ONLY_PROPERTY_PREFIXES} are excluded as well.
+   */
+  @VisibleForTesting
+  static final Set<String> REST_CLIENT_ONLY_PROPERTY_KEYS =
+      ImmutableSet.of(
+          "credential",
+          "token",
+          "scope",
+          "oauth2-server-uri",
+          "audience",
+          "resource",
+          "token-exchange-enabled",
+          "token-refresh-enabled",
+          "token-expires-in-ms");
+
+  /** Prefixes (lower case) of REST-client-only property keys, see above. */
+  private static final List<String> REST_CLIENT_ONLY_PROPERTY_PREFIXES =
+      Collections.unmodifiableList(
+          Arrays.asList("header.", "rest.auth.", "urn:ietf:params:oauth:token-type:"));
+
+  private static final String REDACTED = "****";
+
+  /** Secret values (or parts) shorter than this are never redacted: they would mangle messages. */
+  private static final int MIN_REDACTED_LENGTH = 4;
+
+  /**
+   * Secret values at least this long are redacted wherever they occur. Shorter ones are only
+   * redacted as a whole token (not adjacent to a letter or digit), so that e.g. an access key
+   * {@code dev} does not turn a bucket name {@code dremiodev} into {@code dremio****}.
+   */
+  private static final int MIN_SUBSTRING_REDACTED_LENGTH = 8;
+
   private final List<String> allowedNamespaces;
   private final boolean isRecursiveAllowedNamespaces;
   private final String restEndpoint;
   private final OptionManager optionManager;
   private final Provider<StoragePluginId> pluginIdProvider;
   private final List<Property> configPropertyList;
+  private final boolean isUsingVendedCredentials;
+  private final List<String> sensitiveKeysInPropertyList;
+
+  /** Secret values to redact from user-visible messages, longest first. */
+  private final List<String> secretValues;
+
   private final String name;
 
   public RestIcebergCatalogPlugin(
@@ -128,22 +214,341 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
     this.restEndpoint = pluginConfig.getRestEndpointURI(sabotContext.getDremioConfig());
     this.optionManager = sabotContext.getOptionManager();
     this.configPropertyList = getConfigPropertyList(pluginConfig);
+    this.isUsingVendedCredentials = pluginConfig.isUsingVendedCredentials;
+    this.sensitiveKeysInPropertyList = findSensitivePropertyKeys(pluginConfig.propertyList);
+    this.secretValues = collectSecretValues(pluginConfig);
     this.name = name;
   }
 
-  private static List<Property> getConfigPropertyList(RestIcebergCatalogPluginConfig pluginConfig) {
+  /**
+   * Merges the plain and secret property lists. Null entries (e.g. left behind by {@code
+   * ConnectionConf.applySecretsFrom} when a masked secret was renamed), entries with a blank name
+   * and entries with a null value are skipped, since they cannot be passed to the catalog or to the
+   * Hadoop configuration. Only key names are logged, never values.
+   */
+  @VisibleForTesting
+  static List<Property> getConfigPropertyList(RestIcebergCatalogPluginConfig pluginConfig) {
     List<Property> props = Lists.newArrayList();
-    if (pluginConfig.propertyList != null) {
-      props.addAll(pluginConfig.propertyList);
-    }
-    if (pluginConfig.secretPropertyList != null) {
-      props.addAll(pluginConfig.secretPropertyList);
-    }
+    addValidProperties(props, pluginConfig.propertyList, "propertyList");
+    addValidProperties(props, pluginConfig.secretPropertyList, "secretPropertyList");
     return props;
+  }
+
+  private static void addValidProperties(
+      List<Property> target, @Nullable List<Property> source, String listName) {
+    if (source == null) {
+      return;
+    }
+    for (Property p : source) {
+      if (p == null) {
+        logger.warn(
+            "Ignoring an empty entry in {} of the Iceberg REST catalog source. If a credential was"
+                + " renamed, re-enter its value.",
+            listName);
+        continue;
+      }
+      if (StringUtils.isBlank(p.name)) {
+        logger.warn("Ignoring an entry without a name in {}.", listName);
+        continue;
+      }
+      if (p.value == null) {
+        logger.warn("Ignoring property '{}' in {} because it has no value.", p.name, listName);
+        continue;
+      }
+      target.add(p);
+    }
+  }
+
+  /**
+   * Returns true if the property key names a secret (credential, token, key, password...). Keep in
+   * sync with {@code isSensitivePropertyKey} in {@code dac/ui/src/utils/sourceUtils.ts}, which
+   * blocks these keys in the plain property list when a source is saved.
+   */
+  @VisibleForTesting
+  static boolean isSensitivePropertyKey(@Nullable String key) {
+    if (key == null) {
+      return false;
+    }
+    String k = key.trim().toLowerCase(Locale.ROOT);
+    return SENSITIVE_PROPERTY_KEYS.contains(k)
+        || k.contains("secret")
+        || k.contains("password")
+        || k.contains("account.key")
+        || k.contains("private.key")
+        || k.contains("private-key")
+        || k.contains("sas-token")
+        || k.endsWith(".token")
+        || k.endsWith("-token")
+        || k.endsWith("_token");
+  }
+
+  /** Returns the names (never values) of sensitive keys present in the given property list. */
+  @VisibleForTesting
+  static List<String> findSensitivePropertyKeys(@Nullable List<Property> propertyList) {
+    if (propertyList == null) {
+      return Collections.emptyList();
+    }
+    return propertyList.stream()
+        .filter(p -> p != null && isSensitivePropertyKey(p.name))
+        .map(p -> p.name)
+        .distinct()
+        .collect(Collectors.toList());
+  }
+
+  /**
+   * Values that must never appear in user-visible messages (used for redaction only), sorted
+   * longest first so that a full {@code id:secret} value is redacted before its parts. Values
+   * shorter than {@link #MIN_REDACTED_LENGTH} are left out.
+   */
+  private static List<String> collectSecretValues(RestIcebergCatalogPluginConfig pluginConfig) {
+    Set<String> values = new HashSet<>();
+    List<Property> candidates = new ArrayList<>();
+    if (pluginConfig.secretPropertyList != null) {
+      candidates.addAll(pluginConfig.secretPropertyList);
+    }
+    if (pluginConfig.propertyList != null) {
+      for (Property p : pluginConfig.propertyList) {
+        if (p != null && isSensitivePropertyKey(p.name)) {
+          candidates.add(p);
+        }
+      }
+    }
+    for (Property p : candidates) {
+      if (p == null || StringUtils.isBlank(p.value)) {
+        continue;
+      }
+      addRedactionCandidate(values, p.value);
+      // OAuth2 client credentials are "<client_id>:<client_secret>"; also redact the secret part.
+      int idx = p.value.indexOf(':');
+      if (idx >= 0 && idx < p.value.length() - 1) {
+        addRedactionCandidate(values, p.value.substring(idx + 1));
+      }
+    }
+    List<String> sorted = new ArrayList<>(values);
+    sorted.sort(Comparator.comparingInt(String::length).reversed());
+    return Collections.unmodifiableList(sorted);
+  }
+
+  private static void addRedactionCandidate(Set<String> values, String candidate) {
+    if (candidate.trim().length() >= MIN_REDACTED_LENGTH) {
+      values.add(candidate);
+    }
+  }
+
+  /** Returns true if the property only configures the REST client (see constants above). */
+  @VisibleForTesting
+  static boolean isRestClientOnlyPropertyKey(@Nullable String key) {
+    if (key == null) {
+      return false;
+    }
+    String k = key.trim().toLowerCase(Locale.ROOT);
+    if (REST_CLIENT_ONLY_PROPERTY_KEYS.contains(k)) {
+      return true;
+    }
+    for (String prefix : REST_CLIENT_ONLY_PROPERTY_PREFIXES) {
+      if (k.startsWith(prefix)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  @Override
+  public void start() throws IOException {
+    if (!sensitiveKeysInPropertyList.isEmpty()) {
+      logger.warn(
+          "Iceberg REST catalog source {} has sensitive keys {} in its plain catalog properties."
+              + " Their values are stored and returned unmasked; move them to the catalog"
+              + " credentials (secret properties) instead.",
+          name,
+          sensitiveKeysInPropertyList);
+    }
+    if (isUsingVendedCredentials) {
+      logger.info(
+          "Iceberg REST catalog source {} requests vended credentials ({}={}). Data files are"
+              + " still accessed with the storage properties configured on the source.",
+          name,
+          ACCESS_DELEGATION_HEADER_PROPERTY,
+          VENDED_CREDENTIALS_DELEGATION_MODE);
+    }
+    super.start();
+  }
+
+  /**
+   * Copies the source's catalog properties (including {@code fs.*} storage settings) into the given
+   * Hadoop configuration. Called eagerly from {@link #createCatalog(Configuration)} (which runs in
+   * {@code start()} before the file system cache is created) so that storage settings are present
+   * without waiting for the lazily built REST catalog. REST-client-only properties (OAuth2
+   * credential/token/scope, request headers including the vended-credentials header) are passed to
+   * the catalog only and never copied here.
+   */
+  @VisibleForTesting
+  void applyConfigPropertiesToFsConf(Configuration conf) {
+    conf.set(IcebergUtils.ENABLE_AZURE_ABFSS_SCHEME, "true");
+    for (Property p : configPropertyList) {
+      if (!isRestClientOnlyPropertyKey(p.name)) {
+        conf.set(p.name, p.value);
+      }
+    }
+  }
+
+  /**
+   * Every copy carries the source's catalog properties, independently of whether the REST catalog
+   * has been built yet (e.g. on executors that never contact the catalog).
+   */
+  @Override
+  public Configuration getFsConfCopy() {
+    Configuration conf = super.getFsConfCopy();
+    if (configPropertyList != null) {
+      applyConfigPropertiesToFsConf(conf);
+    }
+    return conf;
+  }
+
+  @Override
+  public SourceState getState() {
+    final CatalogAccessor accessor;
+    try {
+      accessor = getCatalogAccessor();
+    } catch (UserException e) {
+      // Not started or already closed: keep the generic behavior.
+      return super.getState();
+    }
+    try {
+      accessor.checkState();
+      return SourceState.GOOD;
+    } catch (Exception ex) {
+      String description = describeConnectionFailure(ex);
+      logger.debug(
+          "Iceberg REST catalog source {} is not reachable or rejected the request: {}",
+          name,
+          description);
+      return SourceState.badState(
+          String.format(
+              "Could not connect to %s, check your connection information and credentials", name),
+          String.format("Failure connecting to source: %s", description));
+    }
+  }
+
+  /**
+   * Builds a user-facing description of a catalog connection/authentication failure, with a hint
+   * based on the Iceberg REST error type. Configured secret values are redacted.
+   */
+  @VisibleForTesting
+  String describeConnectionFailure(Throwable failure) {
+    String hint;
+    Throwable reported = failure;
+    Throwable networkCause = findNetworkCause(failure);
+    NotAuthorizedException notAuthorized = findCause(failure, NotAuthorizedException.class);
+    ForbiddenException forbidden = findCause(failure, ForbiddenException.class);
+    BadRequestException badRequest = findCause(failure, BadRequestException.class);
+    RESTException restException = findCause(failure, RESTException.class);
+    if (networkCause != null) {
+      reported = networkCause;
+      hint =
+          String.format(
+              "Unable to reach the Iceberg REST catalog at %s. Check the endpoint URI and network"
+                  + " connectivity.",
+              sanitizeEndpoint(restEndpoint));
+    } else if (notAuthorized != null) {
+      reported = notAuthorized;
+      hint =
+          "The Iceberg REST catalog rejected the credentials (HTTP 401). Check the OAuth2"
+              + " credential or token and the OAuth2 server URI.";
+    } else if (forbidden != null) {
+      reported = forbidden;
+      hint =
+          "The Iceberg REST catalog denied access (HTTP 403). Check the privileges granted to the"
+              + " configured principal.";
+    } else if (badRequest != null) {
+      reported = badRequest;
+      hint =
+          "The Iceberg REST catalog rejected the request (HTTP 400). Check the catalog properties"
+              + " required by the catalog, such as 'warehouse' and the OAuth2 'scope' and"
+              + " 'credential'.";
+    } else if (restException != null) {
+      reported = restException;
+      hint =
+          "The Iceberg REST catalog returned an unexpected response. Check the endpoint URI and"
+              + " the 'warehouse' catalog property.";
+    } else {
+      hint = "Could not initialize the Iceberg REST catalog client.";
+    }
+    String detail =
+        reported.getMessage() != null ? reported.getMessage() : reported.getClass().getSimpleName();
+    return redactSecrets(hint + " Details: " + detail);
+  }
+
+  @VisibleForTesting
+  String redactSecrets(@Nullable String message) {
+    if (message == null || secretValues.isEmpty()) {
+      return message;
+    }
+    String result = message;
+    for (String secret : secretValues) {
+      if (secret.length() >= MIN_SUBSTRING_REDACTED_LENGTH) {
+        result = result.replace(secret, REDACTED);
+      } else {
+        result =
+            Pattern.compile("(?<!\\p{Alnum})" + Pattern.quote(secret) + "(?!\\p{Alnum})")
+                .matcher(result)
+                .replaceAll(Matcher.quoteReplacement(REDACTED));
+      }
+    }
+    return result;
+  }
+
+  @Nullable
+  private static Throwable findNetworkCause(Throwable failure) {
+    Throwable t = failure;
+    int depth = 0;
+    while (t != null && depth++ < 20) {
+      if (t instanceof ConnectException
+          || t instanceof UnknownHostException
+          || t instanceof NoRouteToHostException
+          || t instanceof SocketTimeoutException) {
+        return t;
+      }
+      t = t.getCause();
+    }
+    return null;
+  }
+
+  @Nullable
+  private static <T extends Throwable> T findCause(Throwable failure, Class<T> type) {
+    Throwable t = failure;
+    int depth = 0;
+    while (t != null && depth++ < 20) {
+      if (type.isInstance(t)) {
+        return type.cast(t);
+      }
+      t = t.getCause();
+    }
+    return null;
+  }
+
+  /** Drops user info, query and fragment from the endpoint so it is safe to show. */
+  private static String sanitizeEndpoint(@Nullable String endpoint) {
+    if (StringUtils.isBlank(endpoint)) {
+      return "the configured endpoint";
+    }
+    try {
+      URI uri = new URI(endpoint.trim());
+      if (uri.getHost() == null) {
+        return "the configured endpoint";
+      }
+      return new URI(uri.getScheme(), null, uri.getHost(), uri.getPort(), uri.getPath(), null, null)
+          .toString();
+    } catch (URISyntaxException e) {
+      return "the configured endpoint";
+    }
   }
 
   @Override
   public CatalogAccessor createCatalog(Configuration config) {
+    // G-07: make the storage settings (fs.s3a.* etc.) visible in the plugin's Hadoop configuration
+    // right away, instead of only as a side effect of the lazy REST catalog build.
+    applyConfigPropertiesToFsConf(config);
     try {
       return new IcebergRestCatalogAccessor(
           createRestCatalog(config),
@@ -300,15 +705,29 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
     properties.put(CatalogProperties.CATALOG_IMPL, catalogImplClassName);
     properties.put(CatalogProperties.URI, getRestEndpoint());
 
-    config.set(IcebergUtils.ENABLE_AZURE_ABFSS_SCHEME, "true");
+    applyConfigPropertiesToFsConf(config);
     properties.put(IcebergUtils.ENABLE_AZURE_ABFSS_SCHEME, "true");
 
     for (Property p : configPropertyList) {
-      config.set(p.name, p.value);
       properties.put(p.name, p.value);
     }
 
+    // Catalog properties only: the header is a REST client setting, not a Hadoop setting.
+    if (isUsingVendedCredentials
+        && !containsKeyIgnoreCase(properties, ACCESS_DELEGATION_HEADER_PROPERTY)) {
+      properties.put(ACCESS_DELEGATION_HEADER_PROPERTY, VENDED_CREDENTIALS_DELEGATION_MODE);
+    }
+
     return properties;
+  }
+
+  private static boolean containsKeyIgnoreCase(Map<String, String> map, String key) {
+    for (String k : map.keySet()) {
+      if (key.equalsIgnoreCase(k)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   protected Supplier<Catalog> createRestCatalog(Configuration config) {

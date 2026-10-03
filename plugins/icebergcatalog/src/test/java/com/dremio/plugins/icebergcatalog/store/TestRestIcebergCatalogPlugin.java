@@ -31,6 +31,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import com.dremio.BaseTestQuery;
@@ -45,6 +46,7 @@ import com.dremio.context.UserContext;
 import com.dremio.exec.ExecConstants;
 import com.dremio.exec.catalog.PluginSabotContext;
 import com.dremio.exec.catalog.StoragePluginId;
+import com.dremio.exec.catalog.conf.Property;
 import com.dremio.exec.physical.base.ViewOptions;
 import com.dremio.exec.physical.base.WriterOptions;
 import com.dremio.exec.planner.physical.PlannerSettings;
@@ -70,6 +72,7 @@ import com.dremio.service.namespace.dataset.proto.IcebergViewAttributes;
 import com.dremio.service.namespace.dataset.proto.PhysicalDataset;
 import com.dremio.service.namespace.dataset.proto.VirtualDataset;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -96,6 +99,9 @@ import org.mockito.junit.MockitoJUnitRunner;
 
 @RunWith(MockitoJUnitRunner.class)
 public class TestRestIcebergCatalogPlugin extends BaseTestQuery {
+  private static final String VENDED_HEADER = "header.X-Iceberg-Access-Delegation";
+  private static final String VENDED_VALUE = "vended-credentials";
+
   private RestIcebergCatalogPlugin plugin;
 
   @Mock private RestIcebergCatalogPluginConfig mockPluginConfig;
@@ -591,5 +597,124 @@ public class TestRestIcebergCatalogPlugin extends BaseTestQuery {
         this.plugin
             .getFsConfCopy()
             .getBoolean(ExecConstants.ENABLE_S3_V2_CLIENT.getOptionName(), false));
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Phase 2 (RESTCATALOG / Polaris): catalog properties, vended credentials flag, eager FS conf
+  // ---------------------------------------------------------------------------------------------
+
+  private static RestIcebergCatalogPluginConfig newRestConfig(boolean vendedCredentials) {
+    RestIcebergCatalogPluginConfig config = new RestIcebergCatalogPluginConfig();
+    config.restEndpointUri = "http://localhost:8181/api/catalog";
+    config.isUsingVendedCredentials = vendedCredentials;
+    config.propertyList = new ArrayList<>();
+    config.propertyList.add(new Property("warehouse", "test_catalog"));
+    config.propertyList.add(new Property("scope", "PRINCIPAL_ROLE:ALL"));
+    config.propertyList.add(new Property("header.X-Custom-Header", "custom-value"));
+    config.propertyList.add(new Property("fs.s3a.endpoint", "127.0.0.1:9000"));
+    config.propertyList.add(new Property("fs.s3a.path.style.access", "true"));
+    config.secretPropertyList = new ArrayList<>();
+    config.secretPropertyList.add(new Property("credential", "test-client-id:test-client-value"));
+    return config;
+  }
+
+  private RestIcebergCatalogPlugin newPluginWith(RestIcebergCatalogPluginConfig config) {
+    return new RestIcebergCatalogPluginMock(
+        config, pluginSabotContext, "resticebergcatalog", () -> storagePluginId);
+  }
+
+  @Test
+  public void testBuildCatalogPropertiesHasNoVendedHeaderByDefault() {
+    Map<String, String> props = plugin.buildCatalogProperties(new Configuration());
+    assertThat(props).doesNotContainKey(VENDED_HEADER);
+
+    Map<String, String> restProps =
+        newPluginWith(newRestConfig(false)).buildCatalogProperties(new Configuration());
+    assertThat(restProps).doesNotContainKey(VENDED_HEADER);
+  }
+
+  @Test
+  public void testBuildCatalogPropertiesPassesThroughCatalogProperties() {
+    Configuration configuration = new Configuration();
+    Map<String, String> props =
+        newPluginWith(newRestConfig(false)).buildCatalogProperties(configuration);
+
+    assertThat(props)
+        .containsEntry(CatalogProperties.URI, "http://localhost:8181/api/catalog")
+        .containsEntry("warehouse", "test_catalog")
+        .containsEntry("scope", "PRINCIPAL_ROLE:ALL")
+        .containsEntry("header.X-Custom-Header", "custom-value")
+        .containsEntry("credential", "test-client-id:test-client-value");
+    // Storage settings keep flowing into the Hadoop configuration.
+    assertEquals("127.0.0.1:9000", configuration.get("fs.s3a.endpoint"));
+    assertEquals("true", configuration.get("fs.s3a.path.style.access"));
+    // REST client auth settings are catalog-only.
+    assertThat(configuration.get("credential")).isNull();
+    assertThat(configuration.get("scope")).isNull();
+    assertThat(configuration.get("header.X-Custom-Header")).isNull();
+  }
+
+  @Test
+  public void testBuildCatalogPropertiesAddsVendedHeaderWhenEnabled() {
+    Configuration configuration = new Configuration();
+    Map<String, String> props =
+        newPluginWith(newRestConfig(true)).buildCatalogProperties(configuration);
+
+    assertThat(props).containsEntry(VENDED_HEADER, VENDED_VALUE);
+    assertThat(props).containsEntry("warehouse", "test_catalog");
+    // The header is a REST client setting only; it must not be put into the Hadoop conf.
+    assertThat(configuration.get(VENDED_HEADER)).isNull();
+  }
+
+  @Test
+  public void testBuildCatalogPropertiesKeepsUserProvidedDelegationHeader() {
+    RestIcebergCatalogPluginConfig config = newRestConfig(true);
+    config.propertyList.add(new Property(VENDED_HEADER, "remote-signing"));
+
+    Map<String, String> props = newPluginWith(config).buildCatalogProperties(new Configuration());
+
+    assertThat(props).containsEntry(VENDED_HEADER, "remote-signing");
+  }
+
+  @Test
+  public void testBuildCatalogPropertiesSkipsNullEntries() {
+    RestIcebergCatalogPluginConfig config = newRestConfig(false);
+    config.propertyList.add(null);
+    config.propertyList.add(new Property(null, "orphan-value"));
+    config.secretPropertyList.add(null);
+
+    RestIcebergCatalogPlugin restPlugin = newPluginWith(config);
+    Map<String, String> props = restPlugin.buildCatalogProperties(new Configuration());
+
+    assertThat(props).doesNotContainKey(null);
+    assertThat(props).doesNotContainValue("orphan-value");
+    assertThat(props).containsEntry("warehouse", "test_catalog");
+  }
+
+  @Test
+  public void testFsConfHasS3aPropertiesAfterStartWithoutCatalogCalls() throws Exception {
+    RestIcebergCatalogPlugin restPlugin = newPluginWith(newRestConfig(true));
+    restPlugin.start();
+
+    Configuration fsConf = restPlugin.getFsConfCopy();
+    assertEquals("127.0.0.1:9000", fsConf.get("fs.s3a.endpoint"));
+    assertEquals("true", fsConf.get("fs.s3a.path.style.access"));
+    assertThat(fsConf.get(VENDED_HEADER)).isNull();
+    assertThat(fsConf.get("credential")).isNull();
+    // Nothing above may require talking to the REST catalog.
+    verifyNoInteractions(mockCatalogAccessor);
+  }
+
+  @Test
+  public void testStartFailsWhenPluginIsDisabled() {
+    when(optionManager.getOption(RESTCATALOG_PLUGIN_ENABLED)).thenReturn(false);
+    RestIcebergCatalogPlugin restPlugin = newPluginWith(newRestConfig(false));
+
+    assertThatThrownBy(restPlugin::start)
+        .isInstanceOf(UserException.class)
+        .hasMessageContaining("Iceberg Catalog Source is not supported.");
+    assertThatThrownBy(restPlugin::getCatalogAccessor)
+        .isInstanceOf(UserException.class)
+        .hasMessageContaining("either not started or already closed");
   }
 }
