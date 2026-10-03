@@ -16,6 +16,7 @@
 package com.dremio.plugins.icebergcatalog.store;
 
 import static com.dremio.context.UserContext.SYSTEM_USER_CONTEXT_ID;
+import static com.dremio.exec.catalog.CatalogOptions.RESTCATALOG_FOLDERS_SUPPORTED;
 import static com.dremio.exec.catalog.CatalogOptions.RESTCATALOG_VIEWS_SUPPORTED;
 import static com.dremio.exec.store.IcebergCatalogPluginOptions.RESTCATALOG_PLUGIN_ENABLED;
 import static com.dremio.exec.store.IcebergCatalogPluginOptions.RESTCATALOG_PLUGIN_MUTABLE_ENABLED;
@@ -36,7 +37,9 @@ import static org.mockito.Mockito.when;
 
 import com.dremio.BaseTestQuery;
 import com.dremio.catalog.exception.CatalogEntityAlreadyExistsException;
+import com.dremio.catalog.exception.CatalogEntityForbiddenException;
 import com.dremio.catalog.exception.CatalogEntityNotFoundException;
+import com.dremio.catalog.model.CatalogEntityKey;
 import com.dremio.common.exceptions.UserException;
 import com.dremio.common.logical.FormatPluginConfig;
 import com.dremio.config.DremioConfig;
@@ -50,6 +53,7 @@ import com.dremio.exec.catalog.conf.Property;
 import com.dremio.exec.physical.base.ViewOptions;
 import com.dremio.exec.physical.base.WriterOptions;
 import com.dremio.exec.planner.physical.PlannerSettings;
+import com.dremio.exec.proto.UserBitShared.DremioPBError.ErrorType;
 import com.dremio.exec.record.BatchSchema;
 import com.dremio.exec.store.SchemaConfig;
 import com.dremio.exec.store.dfs.IcebergTableProps;
@@ -84,6 +88,8 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
+import org.apache.iceberg.exceptions.ForbiddenException;
+import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.exceptions.NoSuchViewException;
 import org.apache.iceberg.io.FileIO;
@@ -552,6 +558,54 @@ public class TestRestIcebergCatalogPlugin extends BaseTestQuery {
     assertThat(icebergModel).isInstanceOf(IcebergCatalogModel.class);
     IcebergCatalogModel icebergCatalogModel = (IcebergCatalogModel) icebergModel;
     assertThat(icebergCatalogModel.getQueryUserId()).isEqualTo(SYSTEM_USER_CONTEXT_ID);
+  }
+
+  @Test
+  public void testCreateFolderReportsADeniedRequestAsForbidden() {
+    when(optionManager.getOption(RESTCATALOG_FOLDERS_SUPPORTED)).thenReturn(true);
+    List<String> path = Arrays.asList("resticebergcatalog", "ns1");
+    UserException denied =
+        RestCatalogExceptionMapper.forbidden(
+            new ForbiddenException("Forbidden: not authorized for op CREATE_NAMESPACE"),
+            "create folder",
+            "[ns1]");
+    when(mockCatalogAccessor.createFolder(eq(path), any())).thenThrow(denied);
+
+    assertThatThrownBy(() -> plugin.createFolder(CatalogEntityKey.of(path), null))
+        .isInstanceOf(CatalogEntityForbiddenException.class)
+        .hasMessageContaining("denied the request to create folder [ns1]")
+        .hasMessageContaining("CREATE_NAMESPACE");
+  }
+
+  @Test
+  public void testDeleteNonEmptyFolderIsValidationError() throws Exception {
+    // A validation error (not CatalogFolderNotEmptyException): DROP FOLDER reports it as is, while
+    // it does not handle CatalogFolderNotEmptyException.
+    when(optionManager.getOption(RESTCATALOG_FOLDERS_SUPPORTED)).thenReturn(true);
+    List<String> path = Arrays.asList("resticebergcatalog", "ns1", "ns2");
+    when(mockCatalogAccessor.dropFolder(path))
+        .thenThrow(new NamespaceNotEmptyException("Namespace ns1.ns2 is not empty"));
+
+    assertThatThrownBy(() -> plugin.deleteFolder(CatalogEntityKey.of(path)))
+        .isInstanceOf(UserException.class)
+        .hasMessageContaining("Folder [ns1.ns2] cannot be deleted because it is not empty")
+        .hasCauseInstanceOf(NamespaceNotEmptyException.class)
+        .satisfies(
+            t -> assertThat(((UserException) t).getErrorType()).isEqualTo(ErrorType.VALIDATION));
+  }
+
+  @Test
+  public void testCreateFolderPassesOtherUserErrorsThrough() {
+    when(optionManager.getOption(RESTCATALOG_FOLDERS_SUPPORTED)).thenReturn(true);
+    List<String> path = Arrays.asList("resticebergcatalog", "zz", "yy");
+    UserException missingParent =
+        UserException.validationError()
+            .message("parent folder [zz] does not exist")
+            .buildSilently();
+    when(mockCatalogAccessor.createFolder(eq(path), any())).thenThrow(missingParent);
+
+    assertThatThrownBy(() -> plugin.createFolder(CatalogEntityKey.of(path), null))
+        .isSameAs(missingParent);
   }
 
   @Test

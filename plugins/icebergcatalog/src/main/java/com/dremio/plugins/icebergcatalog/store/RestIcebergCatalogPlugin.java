@@ -49,6 +49,7 @@ import com.dremio.exec.physical.base.ViewOptions;
 import com.dremio.exec.physical.base.WriterOptions;
 import com.dremio.exec.planner.logical.CreateTableEntry;
 import com.dremio.exec.planner.logical.ViewTable;
+import com.dremio.exec.proto.UserBitShared.DremioPBError.ErrorType;
 import com.dremio.exec.record.BatchSchema;
 import com.dremio.exec.store.ReferenceNotFoundException;
 import com.dremio.exec.store.SchemaConfig;
@@ -70,14 +71,16 @@ import com.dremio.service.namespace.NamespaceAttribute;
 import com.dremio.service.namespace.NamespaceKey;
 import com.dremio.service.namespace.SourceState;
 import com.dremio.service.namespace.dataset.proto.DatasetConfig;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.net.ConnectException;
 import java.net.NoRouteToHostException;
-import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.UnknownHostException;
@@ -92,6 +95,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -99,6 +103,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import javax.annotation.Nullable;
 import javax.inject.Provider;
+import javax.net.ssl.SSLException;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
@@ -108,6 +113,7 @@ import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.exceptions.BadRequestException;
 import org.apache.iceberg.exceptions.ForbiddenException;
@@ -116,7 +122,10 @@ import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.exceptions.NoSuchViewException;
 import org.apache.iceberg.exceptions.NotAuthorizedException;
+import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.exceptions.RESTException;
+import org.apache.iceberg.exceptions.ServiceFailureException;
+import org.apache.iceberg.exceptions.ServiceUnavailableException;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.rest.RESTCatalog;
 import org.apache.iceberg.types.Types;
@@ -171,10 +180,14 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
           "token-refresh-enabled",
           "token-expires-in-ms");
 
-  /** Prefixes (lower case) of REST-client-only property keys, see above. */
+  /**
+   * Prefixes (lower case) of REST-client-only property keys, see above. {@code rest.client.} covers
+   * the HTTP client settings (timeouts, retries).
+   */
   private static final List<String> REST_CLIENT_ONLY_PROPERTY_PREFIXES =
       Collections.unmodifiableList(
-          Arrays.asList("header.", "rest.auth.", "urn:ietf:params:oauth:token-type:"));
+          Arrays.asList(
+              "header.", "rest.auth.", "rest.client.", "urn:ietf:params:oauth:token-type:"));
 
   private static final String REDACTED = "****";
 
@@ -187,6 +200,26 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
    * {@code dev} does not turn a bucket name {@code dremiodev} into {@code dremio****}.
    */
   private static final int MIN_SUBSTRING_REDACTED_LENGTH = 8;
+
+  /**
+   * OAuth2 error codes (RFC 6749 section 5.2) that the Iceberg REST client reports in the message
+   * of the exception it throws when a token request fails.
+   */
+  private static final Pattern OAUTH2_ERROR_CODE =
+      Pattern.compile(
+          "\\b(invalid_client|unauthorized_client|invalid_grant|invalid_scope"
+              + "|unsupported_grant_type|invalid_request)\\b");
+
+  /**
+   * The most recent connection failure reported by a started instance, per source (see {@link
+   * #failureKey}). When creating a source fails, Dremio closes the failed instance and puts back
+   * the source's initial plugin instance, which was never started, and the API error shows the
+   * suggested user action of <em>that</em> instance's state. The never-started instance returns the
+   * recorded failure so that the user sees the actual cause instead of a generic message. Values
+   * are redacted states; entries expire quickly and are removed when a check succeeds.
+   */
+  private static final Cache<String, SourceState> RECENT_FAILURES =
+      Caffeine.newBuilder().maximumSize(1000).expireAfterWrite(2, TimeUnit.MINUTES).build();
 
   private final List<String> allowedNamespaces;
   private final boolean isRecursiveAllowedNamespaces;
@@ -201,6 +234,12 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
   private final List<String> secretValues;
 
   private final String name;
+
+  /** Key of this source in {@link #RECENT_FAILURES}. */
+  private final String failureKey;
+
+  /** Whether {@link #start()} was called on this instance. */
+  private volatile boolean started;
 
   public RestIcebergCatalogPlugin(
       RestIcebergCatalogPluginConfig pluginConfig,
@@ -218,6 +257,7 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
     this.sensitiveKeysInPropertyList = findSensitivePropertyKeys(pluginConfig.propertyList);
     this.secretValues = collectSecretValues(pluginConfig);
     this.name = name;
+    this.failureKey = name + '\n' + restEndpoint;
   }
 
   /**
@@ -355,6 +395,7 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
 
   @Override
   public void start() throws IOException {
+    started = true;
     if (!sensitiveKeysInPropertyList.isEmpty()) {
       logger.warn(
           "Iceberg REST catalog source {} has sensitive keys {} in its plain catalog properties."
@@ -411,38 +452,109 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
     try {
       accessor = getCatalogAccessor();
     } catch (UserException e) {
+      if (!started) {
+        // The initial instance Dremio falls back to after a failed create: report the failure of
+        // the instance that was actually started (see RECENT_FAILURES).
+        SourceState recent = RECENT_FAILURES.getIfPresent(failureKey);
+        if (recent != null) {
+          return recent;
+        }
+      }
       // Not started or already closed: keep the generic behavior.
       return super.getState();
     }
     try {
       accessor.checkState();
+      RECENT_FAILURES.invalidate(failureKey);
       return SourceState.GOOD;
     } catch (Exception ex) {
+      IcebergRestCatalogAccessor.NamespaceListingForbiddenException listingForbidden =
+          findCause(ex, IcebergRestCatalogAccessor.NamespaceListingForbiddenException.class);
+      if (listingForbidden != null) {
+        RECENT_FAILURES.invalidate(failureKey);
+        return namespaceListingForbiddenState(listingForbidden);
+      }
       String description = describeConnectionFailure(ex);
       logger.debug(
           "Iceberg REST catalog source {} is not reachable or rejected the request: {}",
           name,
           description);
-      return SourceState.badState(
-          String.format(
-              "Could not connect to %s, check your connection information and credentials", name),
-          String.format("Failure connecting to source: %s", description));
+      // The suggested user action is what the source create/update API returns as its error
+      // message, so it carries the actionable description.
+      SourceState state =
+          SourceState.badState(
+              String.format("Could not connect to %s. %s", name, description),
+              String.format("Failure connecting to source: %s", description));
+      RECENT_FAILURES.put(failureKey, state);
+      return state;
     }
   }
 
   /**
+   * The catalog accepted the credentials but denied listing the top-level namespaces (HTTP 403).
+   * That only matters when the source discovers every namespace; with allowed namespaces the
+   * principal may legitimately lack privileges on the catalog root.
+   */
+  private SourceState namespaceListingForbiddenState(RuntimeException failure) {
+    String detail =
+        redactSecrets(
+            failure.getMessage() != null
+                ? failure.getMessage()
+                : failure.getClass().getSimpleName());
+    if (!discoversAllNamespaces()) {
+      logger.debug(
+          "Iceberg REST catalog source {} may not list the top-level namespaces; it only uses its"
+              + " allowed namespaces. Details: {}",
+          name,
+          detail);
+      return SourceState.GOOD;
+    }
+    String hint =
+        "Connected to the Iceberg REST catalog, but it denied listing the top-level namespaces (HTTP"
+            + " 403), so no tables will be discovered. Check the privileges granted to the"
+            + " configured principal and the OAuth2 'scope' catalog property, or restrict the source"
+            + " to the namespaces the principal may access with Allowed Namespaces.";
+    logger.debug("Iceberg REST catalog source {}: {} Details: {}", name, hint, detail);
+    return SourceState.warnState(
+        String.format("%s: %s", name, hint),
+        String.format("Failure listing namespaces: %s Details: %s", hint, detail));
+  }
+
+  private boolean discoversAllNamespaces() {
+    List<String> allowed = getAllowedNamespaces();
+    return allowed == null || allowed.stream().allMatch(StringUtils::isBlank);
+  }
+
+  private boolean hasConfigProperty(String key) {
+    for (Property p : configPropertyList) {
+      if (key.equalsIgnoreCase(p.name.trim()) && StringUtils.isNotBlank(p.value)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Builds a user-facing description of a catalog connection/authentication failure, with a hint
-   * based on the Iceberg REST error type. Configured secret values are redacted.
+   * based on the Iceberg REST error type and, for token requests, the OAuth2 error code. Configured
+   * secret values are redacted.
    */
   @VisibleForTesting
   String describeConnectionFailure(Throwable failure) {
     String hint;
     Throwable reported = failure;
     Throwable networkCause = findNetworkCause(failure);
+    SSLException tlsFailure = findCause(failure, SSLException.class);
+    InterruptedIOException timeout = findCause(failure, InterruptedIOException.class);
     NotAuthorizedException notAuthorized = findCause(failure, NotAuthorizedException.class);
     ForbiddenException forbidden = findCause(failure, ForbiddenException.class);
     BadRequestException badRequest = findCause(failure, BadRequestException.class);
+    ServiceFailureException serviceFailure = findCause(failure, ServiceFailureException.class);
+    ServiceUnavailableException unavailable = findCause(failure, ServiceUnavailableException.class);
+    NotFoundException notFound = findCause(failure, NotFoundException.class);
     RESTException restException = findCause(failure, RESTException.class);
+    RuntimeException tokenFailure = notAuthorized != null ? notAuthorized : badRequest;
+    String oauth2Error = tokenFailure != null ? findOAuth2ErrorCode(tokenFailure) : null;
     if (networkCause != null) {
       reported = networkCause;
       hint =
@@ -450,6 +562,29 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
               "Unable to reach the Iceberg REST catalog at %s. Check the endpoint URI and network"
                   + " connectivity.",
               sanitizeEndpoint(restEndpoint));
+    } else if (tlsFailure != null) {
+      // Checked before timeouts and HTTP errors: the TLS handshake fails before any request (and
+      // therefore any credential) is sent.
+      reported = tlsFailure;
+      hint =
+          String.format(
+              "The TLS connection to the Iceberg REST catalog at %s failed. Check that the"
+                  + " endpoint scheme (http or https) matches the catalog service and, if the"
+                  + " catalog uses a self-signed or private CA certificate, that the certificate"
+                  + " is trusted by the Dremio JVM (javax.net.ssl.trustStore).",
+              sanitizeEndpoint(restEndpoint));
+    } else if (timeout != null) {
+      reported = timeout;
+      hint =
+          String.format(
+              "The Iceberg REST catalog at %s did not respond in time. Check that the catalog"
+                  + " service is up and responsive. The client timeouts can be set with the"
+                  + " catalog properties 'rest.client.connection-timeout-ms' and"
+                  + " 'rest.client.socket-timeout-ms'.",
+              sanitizeEndpoint(restEndpoint));
+    } else if (oauth2Error != null) {
+      reported = tokenFailure;
+      hint = describeOAuth2Error(oauth2Error, notAuthorized != null);
     } else if (notAuthorized != null) {
       reported = notAuthorized;
       hint =
@@ -462,21 +597,107 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
               + " configured principal.";
     } else if (badRequest != null) {
       reported = badRequest;
+      if (mentionsWarehouse(badRequest) && !hasConfigProperty("warehouse")) {
+        hint =
+            "The Iceberg REST catalog rejected the request (HTTP 400) because the 'warehouse'"
+                + " catalog property is not set. Set it to the name of the catalog to use (for"
+                + " Apache Polaris, the catalog name).";
+      } else {
+        hint =
+            "The Iceberg REST catalog rejected the request (HTTP 400). Check the catalog"
+                + " properties required by the catalog, such as 'warehouse' and the OAuth2 'scope'"
+                + " and 'credential'.";
+      }
+    } else if (serviceFailure != null) {
+      reported = serviceFailure;
       hint =
-          "The Iceberg REST catalog rejected the request (HTTP 400). Check the catalog properties"
-              + " required by the catalog, such as 'warehouse' and the OAuth2 'scope' and"
-              + " 'credential'.";
+          "The Iceberg REST catalog reported a server error (HTTP 5xx). Check the health and logs"
+              + " of the catalog service, then retry.";
+    } else if (unavailable != null) {
+      reported = unavailable;
+      hint =
+          "The Iceberg REST catalog is unavailable (HTTP 503), also after the client retried the"
+              + " request ('rest.client.max-retries' catalog property, 5 by default). Check the"
+              + " health and logs of the catalog service, then retry.";
+    } else if (mentionsWarehouse(notFound) || mentionsWarehouse(restException)) {
+      reported = notFound != null ? notFound : restException;
+      hint =
+          "The Iceberg REST catalog did not accept the warehouse named by the 'warehouse' catalog"
+              + " property. Check its value (for Apache Polaris, the name of an existing catalog).";
     } else if (restException != null) {
       reported = restException;
       hint =
-          "The Iceberg REST catalog returned an unexpected response. Check the endpoint URI and"
-              + " the 'warehouse' catalog property.";
+          "The Iceberg REST catalog returned an unexpected HTTP error (not 400, 401, 403, 500 or"
+              + " 503), for example 404 when the endpoint URI or the 'warehouse' catalog property"
+              + " is wrong, 409, 429 when the catalog limits the request rate, or 502/504 from a"
+              + " proxy (429, 502, 503 and 504 are retried up to 'rest.client.max-retries' times"
+              + " first). Check the endpoint URI, the 'warehouse' catalog property and the logs of"
+              + " the catalog service.";
     } else {
       hint = "Could not initialize the Iceberg REST catalog client.";
     }
     String detail =
         reported.getMessage() != null ? reported.getMessage() : reported.getClass().getSimpleName();
-    return redactSecrets(hint + " Details: " + detail);
+    return redactSecrets(hint + " Details: " + abbreviateDetail(redactSecrets(detail)));
+  }
+
+  /**
+   * Makes a server-provided error text fit for a one-line message: drops HTML markup (e.g. the
+   * error page of a proxy), collapses whitespace and cuts it to 300 characters. Callers redact
+   * secrets before (so that a cut cannot leave part of a secret behind) and after.
+   */
+  @VisibleForTesting
+  static String abbreviateDetail(String detail) {
+    return RestCatalogExceptionMapper.abbreviateDetail(detail);
+  }
+
+  private String describeOAuth2Error(String code, boolean unauthorized) {
+    switch (code) {
+      case "invalid_client":
+      case "unauthorized_client":
+        return String.format(
+            "The Iceberg REST catalog rejected the credentials (%s). Check the 'credential' catalog"
+                + " credential (client ID and client secret separated by ':') and, if set, the"
+                + " 'oauth2-server-uri' catalog property.",
+            unauthorized ? "HTTP 401" : "OAuth2 error '" + code + "'");
+      case "invalid_scope":
+        return hasConfigProperty("scope")
+            ? "The OAuth2 server rejected the requested scope (OAuth2 error 'invalid_scope')."
+                + " Check the 'scope' catalog property: it must be a scope the principal may"
+                + " request (for Apache Polaris, PRINCIPAL_ROLE:ALL or PRINCIPAL_ROLE:<role>)."
+            : "The OAuth2 server requires a scope (OAuth2 error 'invalid_scope'). Set the 'scope'"
+                + " catalog property (for Apache Polaris, PRINCIPAL_ROLE:ALL or"
+                + " PRINCIPAL_ROLE:<role>).";
+      case "invalid_grant":
+        return "The OAuth2 server rejected the grant (OAuth2 error 'invalid_grant'): the credential"
+            + " or token is invalid, expired or revoked. Check the 'credential' or 'token' catalog"
+            + " credential.";
+      case "unsupported_grant_type":
+        return "The OAuth2 server does not support the requested grant type (OAuth2 error"
+            + " 'unsupported_grant_type'). Check the 'oauth2-server-uri' catalog property and that"
+            + " the server supports the client credentials grant.";
+      default:
+        return String.format(
+            "The OAuth2 server rejected the token request (OAuth2 error '%s'). Check the"
+                + " 'credential', 'scope' and 'oauth2-server-uri' catalog properties.",
+            code);
+    }
+  }
+
+  @Nullable
+  private static String findOAuth2ErrorCode(RuntimeException e) {
+    String message = e.getMessage();
+    if (message == null) {
+      return null;
+    }
+    Matcher matcher = OAUTH2_ERROR_CODE.matcher(message);
+    return matcher.find() ? matcher.group(1) : null;
+  }
+
+  private static boolean mentionsWarehouse(@Nullable Throwable t) {
+    return t != null
+        && t.getMessage() != null
+        && t.getMessage().toLowerCase(Locale.ROOT).contains("warehouse");
   }
 
   @VisibleForTesting
@@ -505,8 +726,7 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
     while (t != null && depth++ < 20) {
       if (t instanceof ConnectException
           || t instanceof UnknownHostException
-          || t instanceof NoRouteToHostException
-          || t instanceof SocketTimeoutException) {
+          || t instanceof NoRouteToHostException) {
         return t;
       }
       t = t.getCause();
@@ -554,10 +774,14 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
           createRestCatalog(config),
           optionManager,
           getAllowedNamespaces(),
-          isRecursiveAllowedNamespaces());
+          isRecursiveAllowedNamespaces(),
+          this::redactSecrets);
     } catch (Exception e) {
+      // Only setup errors end up here: the REST catalog itself is built lazily, on first use.
       throw UserException.connectionError(e)
-          .message("Can't connect to %s catalog. %s", restCatalogImpl().getSimpleName(), e)
+          .message(
+              "Can't create the %s client for source %s. %s",
+              restCatalogImpl().getSimpleName(), name, describeConnectionFailure(e))
           .buildSilently();
     }
   }
@@ -608,6 +832,13 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
               "Storage URI [%s] at folder %s conflicts with other existing namespace",
               storageUri, key.getKeyComponents().toString()),
           e);
+    } catch (UserException e) {
+      // The accessor maps an HTTP 403 to a permission error that carries the server's reason;
+      // report it as forbidden (HTTP 403 in the REST API) instead of a generic conflict.
+      if (e.getErrorType() == ErrorType.PERMISSION) {
+        throw new CatalogEntityForbiddenException(e.getMessage(), e);
+      }
+      throw e;
     }
   }
 
@@ -680,11 +911,15 @@ public class RestIcebergCatalogPlugin extends IcebergCatalogPlugin {
             .buildSilently();
       }
     } catch (NamespaceNotEmptyException e) {
-      throw new CatalogFolderNotEmptyException(
-          String.format(
-              "Folder [%s] cannot be deleted as it contains content.",
-              key.getKeyComponents().toString()),
-          e);
+      // A validation error rather than CatalogFolderNotEmptyException: DROP FOLDER
+      // (DropFolderHandler) does not handle the latter and would report a system error. The REST
+      // API reports both as a validation error.
+      throw RestCatalogExceptionMapper.namespaceNotEmpty(
+          e,
+          Namespace.of(
+              key.getKeyComponents()
+                  .subList(1, key.getKeyComponents().size())
+                  .toArray(new String[0])));
     } catch (NoSuchNamespaceException e) {
       throw new CatalogEntityNotFoundException(
           String.format(

@@ -10,7 +10,7 @@ profiles:
   fast:
     steps: [icebergcatalog-test, icebergcatalog-lint]
   full:
-    steps: [icebergcatalog-test, icebergcatalog-lint, icebergcatalog-static, ui-source-specs]
+    steps: [icebergcatalog-test, icebergcatalog-lint, icebergcatalog-static, ui-source-specs, e2e-harness-lint]
 # The server accepts at most 32 MiB / 10000 tar entries, and localci archives every
 # directory (including ignored target/ trees). Steps build only plugins/icebergcatalog and
 # dac/ui; other modules resolve from ~/.m2 and need only their pom.xml in the archive.
@@ -321,10 +321,13 @@ steps:
       - ./mvnw -o -B -ntp -Ddremio.no-ui -Dmaven.gitcommitid.skip=true -pl plugins/icebergcatalog spotless:check license:check checkstyle:check
     timeout: 15m
   # errorprone, forbiddenapis and enforcer, which the fast flags skip but upstream CI runs.
-  # Falls back to online mode when the errorprone toolchain is not in ~/.m2 yet.
+  # Falls back to online mode when the errorprone toolchain is not in ~/.m2 yet. The sources are
+  # touched first: icebergcatalog-test already compiled them without errorprone, and an up-to-date
+  # module would otherwise skip compilation (and errorprone) entirely.
   - name: icebergcatalog-static
     depends_on: [icebergcatalog-test]
     commands:
+      - find plugins/icebergcatalog/src -name '*.java' -exec touch {} +
       - ./mvnw -o -B -ntp -Ddremio.no-ui -Dmaven.gitcommitid.skip=true -DskipTests -pl plugins/icebergcatalog verify || ./mvnw -B -ntp -Ddremio.no-ui -Dmaven.gitcommitid.skip=true -DskipTests -pl plugins/icebergcatalog verify
     timeout: 30m
   # Mocha specs for the source forms. Reuses the dev checkout's installed node_modules
@@ -349,3 +352,11 @@ steps:
       - export PATH="$DREMIO_UI_NODE_DIR:$PATH"; pnpm exec eslint src/constants/sourceTypes.js src/utils/sourceUtils.ts src/pages/HomePage/components/modals/AddSourceModal src/pages/HomePage/components/modals/EditSourceView.jsx
       - export PATH="$DREMIO_UI_NODE_DIR:$PATH"; pnpm exec prettier --check src/constants/sourceTypes.js src/utils/sourceUtils.ts src/utils/sourceUtils-spec.ts src/pages/HomePage/components/modals/AddSourceModal src/pages/HomePage/components/modals/EditSourceView.jsx
     timeout: 30m
+  # Static checks of the Polaris E2E harness (scripts/polaris-e2e): shellcheck (local binary, or
+  # the koalaman/shellcheck image) and the Apache license header of every script.
+  - name: e2e-harness-lint
+    working_dir: scripts/polaris-e2e
+    commands:
+      - 'for f in *.sh; do grep -q "Licensed under the Apache License, Version 2.0" "$f" || { echo "missing license header in $f"; exit 1; }; done'
+      - 'if command -v shellcheck >/dev/null 2>&1; then shellcheck -x *.sh; else docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:stable -x *.sh; fi'
+    timeout: 10m

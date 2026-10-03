@@ -778,7 +778,8 @@ public class TestRestIcebergCatalogPluginConfig extends BaseTestQuery {
             + TEST_CLIENT_SECRET
             + ")\"}";
 
-    Logger pluginLogger = (Logger) LoggerFactory.getLogger(RestIcebergCatalogPlugin.class);
+    Logger pluginLogger =
+        (Logger) LoggerFactory.getLogger(RestIcebergCatalogPlugin.class.getName());
     Logger dremioLogger = (Logger) LoggerFactory.getLogger("com.dremio");
     Logger rootLogger = (Logger) LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
     Level previousPluginLevel = pluginLogger.getLevel();
@@ -916,7 +917,7 @@ public class TestRestIcebergCatalogPluginConfig extends BaseTestQuery {
             .describeConnectionFailure(
                 new RESTException("Unable to process: %s", "test-client-id:" + TEST_CLIENT_SECRET));
 
-    assertTrue(description, description.contains("returned an unexpected response"));
+    assertTrue(description, description.contains("returned an unexpected HTTP error"));
     assertTrue(description, description.contains("Unable to process: ****"));
     assertNoSecretIn("description", description);
   }
