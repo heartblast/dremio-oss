@@ -14,6 +14,8 @@ profiles:
 # The server accepts at most 32 MiB / 10000 tar entries, and localci archives every
 # directory (including ignored target/ trees). Steps build only plugins/icebergcatalog and
 # dac/ui; other modules resolve from ~/.m2 and need only their pom.xml in the archive.
+# Keep root src/: the root pom puts src/test/log-config (logback-test.xml) on the surefire
+# classpath; without it tests log at DEBUG.
 archive_exclude:
   - build-tools/configs/target
   - build-tools/errorprone/target
@@ -90,7 +92,9 @@ archive_exclude:
   - plugins/hive-common/target
   - plugins/hive-function-registry/src
   - plugins/hive-function-registry/target
-  - plugins/hive/src
+  # plugins/icebergcatalog copies plugins/hive/src/main/java/**/FileSystemConfUtil.java at build time.
+  - plugins/hive/src/main/resources
+  - plugins/hive/src/test
   - plugins/hive/target
   - plugins/hive2/launcher/src
   - plugins/hive2/launcher/target
@@ -273,7 +277,6 @@ archive_exclude:
   - services/users/target
   - services/usersessions/src
   - services/usersessions/target
-  - src
   - target
   - tools/attach-tool/src
   - tools/attach-tool/target
@@ -303,13 +306,15 @@ archive_exclude:
   - ui/target
   - ui/translations/target
 steps:
-  # Compile main + test sources and run every test of the module (JDK 11 toolchain).
+  # Compile main + test sources and run every test of the module (JDK 11 toolchain). Test stdout
+  # goes to surefire-reports/*-output.txt so the CI log stays under the agent's log cap.
   - name: icebergcatalog-test
     commands:
-      - ./mvnw -o -B -ntp -Ddremio.no-ui -Ddremio.no-lint -Derrorprone.skip -Dmaven.gitcommitid.skip=true -pl plugins/icebergcatalog test
+      - ./mvnw -o -B -ntp -Ddremio.no-ui -Ddremio.no-lint -Derrorprone.skip -Dmaven.gitcommitid.skip=true -Dmaven.test.redirectTestOutputToFile=true -pl plugins/icebergcatalog test
     timeout: 30m
     artifacts:
       - plugins/icebergcatalog/target/surefire-reports/*.xml
+      - plugins/icebergcatalog/target/surefire-reports/*.txt
   # Same checks as `scripts/dev lint`: google-java-format, sortpom, license headers, checkstyle.
   - name: icebergcatalog-lint
     commands:

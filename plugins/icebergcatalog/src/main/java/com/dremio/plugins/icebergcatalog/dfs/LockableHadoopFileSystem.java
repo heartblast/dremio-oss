@@ -45,6 +45,8 @@ class LockableHadoopFileSystem {
   public void unlock() {
     int newCount = refCount.decrementAndGet();
     if (newCount < 0) {
+      // Undo the decrement so an unbalanced unlock() cannot leave the count stuck below zero.
+      refCount.incrementAndGet();
       throw new IllegalStateException("Negative reference count on FS " + this);
     }
     if (newCount == 0) {

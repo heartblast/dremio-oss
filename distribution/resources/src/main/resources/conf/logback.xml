@@ -215,6 +215,16 @@
     <level value="debug"/>
   </logger>
 
+  <!-- Apache HttpClient 5 wire/header logs carry request bodies and Authorization headers, e.g.
+       OAuth2 client_secret and bearer tokens of the Iceberg REST catalog client. Keep them off
+       even when the root level is raised for debugging. -->
+  <logger name="org.apache.hc.client5.http.wire">
+    <level value="info"/>
+  </logger>
+  <logger name="org.apache.hc.client5.http.headers">
+    <level value="info"/>
+  </logger>
+
   <root>
     <level value="${dremio.log.root.level:-error}"/>
     <if condition='isDefined("dremio.log.path")'>
